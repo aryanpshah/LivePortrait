@@ -32,3 +32,51 @@ LivePortrait_env/
 src/utils/dependencies/XPose/models/UniPose/ops/build
 src/utils/dependencies/XPose/models/UniPose/ops/dist
 src/utils/dependencies/XPose/models/UniPose/ops/MultiScaleDeformableAttention.egg-info
+
+# Common virtual environment, package and build artifacts to ignore
+# Python virtualenvs and local package folders
+venv/
+.venv/
+env/
+ENV/
+LivePortrait_env/
+# PEP 582 (__pypackages__)
+__pypackages__/
+
+# Python build/distribution
+dist/
+build/
+pip-wheel-metadata/
+*.egg-info/
+
+# Installed/packaged site packages (local installs, caches)
+site-packages/
+*.egg
+
+# Generic package directories (includes top-level and nested folders named "packages")
+packages/
+**/packages/
+
+# Node / JavaScript
+node_modules/
+npm-debug.log*
+yarn-error.log*
+.pnp/
+
+# Caches, compiled files, test artifacts
+.pytest_cache/
+.mypy_cache/
+.cache/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+**/*.py[cod]
+
+# Common OS files
+.DS_Store
+Thumbs.db
+
+# Project-specific outputs and large model folders
+# If you want to keep model weights in the repo, remove the pretrained_weights/ line below.
+outputs/
+pretrained_weights/
