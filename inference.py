@@ -52,6 +52,14 @@ def main():
     # specify configs for inference
     inference_cfg = partial_fields(InferenceConfig, args.__dict__)
     crop_cfg = partial_fields(CropConfig, args.__dict__)
+    # --- Force CPU and safe defaults ---
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""   # hide GPUs if any
+    inference_cfg.flag_force_cpu = True
+    inference_cfg.flag_use_half_precision = False
+    inference_cfg.flag_do_torch_compile = False
+    inference_cfg.device_id = 0
+    # -----------------------------------
+
 
     live_portrait_pipeline = LivePortraitPipeline(
         inference_cfg=inference_cfg,

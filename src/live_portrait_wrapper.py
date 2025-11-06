@@ -26,19 +26,16 @@ class LivePortraitWrapper(object):
 
     def __init__(self, inference_cfg: InferenceConfig):
 
+        # --- Hard-force CPU & safe defaults ---
         self.inference_cfg = inference_cfg
-        self.device_id = inference_cfg.device_id
-        self.compile = inference_cfg.flag_do_torch_compile
-        if inference_cfg.flag_force_cpu:
-            self.device = 'cpu'
-        else:
-            try:
-                if torch.backends.mps.is_available():
-                    self.device = 'mps'
-                else:
-                    self.device = 'cuda:' + str(self.device_id)
-            except:
-                self.device = 'cuda:' + str(self.device_id)
+        self.inference_cfg.flag_force_cpu = True
+        self.inference_cfg.flag_use_half_precision = False
+        self.inference_cfg.flag_do_torch_compile = False
+        self.device = "cpu"
+        self.device_id = 0
+        self.compile = False
+        log(f"[LivePortraitWrapper] Running on device: {self.device}")
+        # --------------------------------------
 
         model_config = yaml.load(open(inference_cfg.models_config, 'r'), Loader=yaml.SafeLoader)
         # init F
@@ -59,15 +56,11 @@ class LivePortraitWrapper(object):
             log(f'Load stitching_retargeting_module from {osp.realpath(inference_cfg.checkpoint_S)} done.')
         else:
             self.stitching_retargeting_module = None
-        # Optimize for inference
-        if self.compile:
-            torch._dynamo.config.suppress_errors = True  # Suppress errors and fall back to eager execution
-            self.warping_module = torch.compile(self.warping_module, mode='max-autotune')
-            self.spade_generator = torch.compile(self.spade_generator, mode='max-autotune')
 
         self.timer = Timer()
 
     def inference_ctx(self):
+        # autocast disabled because flag_use_half_precision=False above
         if self.device == "mps":
             ctx = contextlib.nullcontext()
         else:
@@ -281,9 +274,6 @@ class LivePortraitWrapper(object):
         """
         # The line 18 in Algorithm 1: D(W(f_s; x_s, x′_d,i)）
         with torch.no_grad(), self.inference_ctx():
-            if self.compile:
-                # Mark the beginning of a new CUDA Graph step
-                torch.compiler.cudagraph_mark_step_begin()
             # get decoder input
             ret_dct = self.warping_module(feature_3d, kp_source=kp_source, kp_driving=kp_driving)
             # decode
@@ -339,21 +329,16 @@ class LivePortraitWrapperAnimal(LivePortraitWrapper):
     Wrapper for Animal
     """
     def __init__(self, inference_cfg: InferenceConfig):
-        # super().__init__(inference_cfg)  # 调用父类的初始化方法
-
+        # --- Hard-force CPU & safe defaults for animal mode too ---
         self.inference_cfg = inference_cfg
-        self.device_id = inference_cfg.device_id
-        self.compile = inference_cfg.flag_do_torch_compile
-        if inference_cfg.flag_force_cpu:
-            self.device = 'cpu'
-        else:
-            try: 
-                if torch.backends.mps.is_available():
-                    self.device = 'mps'
-                else:
-                    self.device = 'cuda:' + str(self.device_id)
-            except:
-                    self.device = 'cuda:' + str(self.device_id)
+        self.inference_cfg.flag_force_cpu = True
+        self.inference_cfg.flag_use_half_precision = False
+        self.inference_cfg.flag_do_torch_compile = False
+        self.device = "cpu"
+        self.device_id = 0
+        self.compile = False
+        log(f"[LivePortraitWrapperAnimal] Running on device: {self.device}")
+        # ----------------------------------------------------------
 
         model_config = yaml.load(open(inference_cfg.models_config, 'r'), Loader=yaml.SafeLoader)
         # init F
@@ -374,11 +359,5 @@ class LivePortraitWrapperAnimal(LivePortraitWrapper):
             log(f'Load stitching_retargeting_module from {osp.realpath(inference_cfg.checkpoint_S_animal)} done.')
         else:
             self.stitching_retargeting_module = None
-
-        # Optimize for inference
-        if self.compile:
-            torch._dynamo.config.suppress_errors = True  # Suppress errors and fall back to eager execution
-            self.warping_module = torch.compile(self.warping_module, mode='max-autotune')
-            self.spade_generator = torch.compile(self.spade_generator, mode='max-autotune')
 
         self.timer = Timer()
