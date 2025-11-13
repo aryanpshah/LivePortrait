@@ -106,28 +106,103 @@ def soft_knee_scalar(d: torch.Tensor, tau: float) -> torch.Tensor:
     a_prime = float(tau) * torch.tanh(a / float(tau))
     return torch.sign(d) * a_prime
 
-# ====== NEW: simple keypoint and mouth-vector visualizers ======
+def kp_to_pixels(kp_xy: torch.Tensor | np.ndarray, height: int, width: int) -> np.ndarray:
+    """Convert normalized [-1, 1] coords (or already-pixel coords) into pixel space."""
+    if isinstance(kp_xy, torch.Tensor):
+        xy = kp_xy.detach().float().cpu().numpy()
+    else:
+        xy = np.asarray(kp_xy, dtype=np.float32)
+
+    x = xy[:, 0]
+    y = xy[:, 1]
+    if np.all(np.isfinite(xy)) and np.median(np.abs(xy)) <= 1.2:
+        px = (x + 1.0) * 0.5 * (width - 1)
+        py = (y + 1.0) * 0.5 * (height - 1)
+    else:
+        px, py = x, y
+
+    pts = np.stack([px, py], axis=1)
+    pts[:, 0] = np.clip(pts[:, 0], 0, width - 1)
+    pts[:, 1] = np.clip(pts[:, 1], 0, height - 1)
+    return pts
+
+def draw_keypoint_map(
+    img_rgb: np.ndarray,
+    kp_pixels: np.ndarray | torch.Tensor,
+    output_path: str,
+) -> None:
+    dir_name = os.path.dirname(output_path)
+    if dir_name:
+        os.makedirs(dir_name, exist_ok=True)
+
+    canvas = img_rgb.copy()
+    if isinstance(kp_pixels, torch.Tensor):
+        pts = kp_pixels.detach().cpu().numpy()
+    else:
+        pts = np.asarray(kp_pixels, dtype=np.float32)
+    if canvas.dtype != np.uint8:
+        canvas = np.clip(canvas, 0, 255).astype(np.uint8)
+
+    pts = np.round(pts).astype(np.int32)
+    pts[:, 0] = np.clip(pts[:, 0], 0, canvas.shape[1] - 1)
+    pts[:, 1] = np.clip(pts[:, 1], 0, canvas.shape[0] - 1)
+
+    for u, v in pts:
+        cv2.circle(canvas, (int(u), int(v)), 3, (64, 224, 255), -1, lineType=cv2.LINE_AA)
+
+    cv2.imwrite(output_path, cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR))
+
+def save_keypoint_map(
+    wrapper: LivePortraitWrapper,
+    img_rgb: np.ndarray,
+    kp_info: Dict[str, torch.Tensor],
+    output_path: str,
+) -> None:
+    """Match keypoint_map.py logic by projecting canonical keypoints back to the image."""
+    if img_rgb is None or kp_info is None:
+        raise ValueError("img_rgb and kp_info must be provided for keypoint visualization.")
+
+    src_h, src_w = img_rgb.shape[:2]
+    transformed = wrapper.transform_keypoint(kp_info)[0][:, :2]
+    model_h, model_w = wrapper.inference_cfg.input_shape
+    kp_model_px = kp_to_pixels(transformed, model_h, model_w)
+
+    scale_x = src_w / float(model_w)
+    scale_y = src_h / float(model_h)
+    kp_pixels = kp_model_px.copy()
+    kp_pixels[:, 0] = np.clip(kp_pixels[:, 0] * scale_x, 0, src_w - 1)
+    kp_pixels[:, 1] = np.clip(kp_pixels[:, 1] * scale_y, 0, src_h - 1)
+
+    draw_keypoint_map(img_rgb, kp_pixels, output_path)
+
 def draw_kp_map_simple(img_rgb: np.ndarray, kp_xy: torch.Tensor, path: str, mouth_idxs=None):
-    """Render all keypoints; color mouth differently; label indices for mouth."""
-    import cv2, numpy as np
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    """Diagnostic-only normalized map with optional mouth annotations."""
+    dir_name = os.path.dirname(path)
+    if dir_name:
+        os.makedirs(dir_name, exist_ok=True)
     canvas = img_rgb.copy()
     H, W = canvas.shape[:2]
     xy = kp_xy.detach().cpu().numpy()
-    x = xy[:,0]; y = xy[:,1]
-    # normalize to image box for plotting
+    x = xy[:, 0]
+    y = xy[:, 1]
     x_ = (x - x.min()) / max(1e-6, (x.max() - x.min()))
     y_ = (y - y.min()) / max(1e-6, (y.max() - y.min()))
-    px = (x_ * (W-1)).astype(np.int32)
-    py = (y_ * (H-1)).astype(np.int32)
-
-    # draw all points
-    for i,(u,v) in enumerate(zip(px,py)):
-        c = (40, 220, 255) if (mouth_idxs is not None and i in mouth_idxs) else (200,200,200)
-        cv2.circle(canvas, (u,v), 3, c, -1, lineType=cv2.LINE_AA)
+    px = (x_ * (W - 1)).astype(np.int32)
+    py = (y_ * (H - 1)).astype(np.int32)
+    for i, (u, v) in enumerate(zip(px, py)):
+        c = (40, 220, 255) if (mouth_idxs is not None and i in mouth_idxs) else (200, 200, 200)
+        cv2.circle(canvas, (int(u), int(v)), 3, c, -1, lineType=cv2.LINE_AA)
         if mouth_idxs is not None and i in mouth_idxs:
-            cv2.putText(canvas, str(i), (u+3, v-3), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255,255,255), 1, cv2.LINE_AA)
-
+            cv2.putText(
+                canvas,
+                str(i),
+                (int(u) + 3, int(v) - 3),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.35,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
     cv2.imwrite(path, cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR))
 
 def draw_mouth_vectors(img_rgb: np.ndarray, kp_xy: torch.Tensor, delta: torch.Tensor, mouth_mask: torch.Tensor, path: str, scale_px: float=180.0):
@@ -314,12 +389,13 @@ def main(
     left_mask = x_can < x_center
     right_mask = ~left_mask
 
-    # A) Save a simple target keypoint map
+    # A) Save a target keypoint map using the unified projection logic
     os.makedirs("outputs/diagnostics", exist_ok=True)
-    draw_kp_map_simple(
+    save_keypoint_map(
+        wrap,
         target_rgb,
-        kp_can_t[:, :2],
-        "outputs/diagnostics/target_kp.jpg"
+        T_kp,
+        "outputs/diagnostics/target_keypoint_map.jpg",
     )
 
     # -------- Auto flip donor to best match target pose (optional) --------
@@ -338,10 +414,11 @@ def main(
     D = wrap.prepare_source(donor_rgb)
     D_kp = wrap.get_kp_info(D, flag_refine_info=True)
     kp_can_d = D_kp["kp"][0]
-    draw_kp_map_simple(
+    save_keypoint_map(
+        wrap,
         donor_rgb,
-        kp_can_d[:, :2],
-        "outputs/diagnostics/donor_kp.jpg"
+        D_kp,
+        "outputs/diagnostics/donor_keypoint_map.jpg",
     )
 
     # Canonical LR delta (right-minus-left). Use flag to choose sign.
@@ -672,6 +749,13 @@ def main(
 
     out_asym = wrap.warp_decode(feat_3d, kp_source, kp_driving)
     img_asym = wrap.parse_output(out_asym["out"])[0]
+
+    save_keypoint_map(
+        wrap,
+        img_asym,
+        T_kp_mod,
+        "outputs/diagnostics/result_keypoint_map.jpg",
+    )
 
     # save diagnostics
     os.makedirs("outputs/diagnostics", exist_ok=True)
