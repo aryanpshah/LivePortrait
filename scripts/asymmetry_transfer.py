@@ -1,4 +1,4 @@
-import sys, os, os.path as osp, cv2, torch
+import sys, os, os.path as osp, cv2, torch, math
 import numpy as np
 from typing import Dict
 
@@ -136,6 +136,9 @@ def draw_keypoint_map(
         os.makedirs(dir_name, exist_ok=True)
 
     canvas = img_rgb.copy()
+    if canvas.dtype != np.uint8:
+        canvas = np.clip(canvas, 0, 255).astype(np.uint8)
+    canvas_bgr = cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR)
     if isinstance(kp_pixels, torch.Tensor):
         pts = kp_pixels.detach().cpu().numpy()
     else:
@@ -152,16 +155,14 @@ def draw_keypoint_map(
 
     cv2.imwrite(output_path, cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR))
 
-def save_keypoint_map(
+def project_keypoints_to_image(
     wrapper: LivePortraitWrapper,
-    img_rgb: np.ndarray,
     kp_info: Dict[str, torch.Tensor],
-    output_path: str,
-) -> None:
-    """Match keypoint_map.py logic by projecting canonical keypoints back to the image."""
+    img_rgb: np.ndarray,
+) -> np.ndarray:
+    """Return pixel-space keypoints using the same projection as keypoint_map.py."""
     if img_rgb is None or kp_info is None:
         raise ValueError("img_rgb and kp_info must be provided for keypoint visualization.")
-
     src_h, src_w = img_rgb.shape[:2]
     transformed = wrapper.transform_keypoint(kp_info)[0][:, :2]
     model_h, model_w = wrapper.inference_cfg.input_shape
@@ -172,7 +173,18 @@ def save_keypoint_map(
     kp_pixels = kp_model_px.copy()
     kp_pixels[:, 0] = np.clip(kp_pixels[:, 0] * scale_x, 0, src_w - 1)
     kp_pixels[:, 1] = np.clip(kp_pixels[:, 1] * scale_y, 0, src_h - 1)
+    return kp_pixels
 
+def save_keypoint_map(
+    wrapper: LivePortraitWrapper,
+    img_rgb: np.ndarray,
+    kp_info: Dict[str, torch.Tensor],
+    output_path: str,
+    kp_pixels: np.ndarray | torch.Tensor | None = None,
+) -> None:
+    """Match keypoint_map.py logic by projecting canonical keypoints back to the image."""
+    if kp_pixels is None:
+        kp_pixels = project_keypoints_to_image(wrapper, kp_info, img_rgb)
     draw_keypoint_map(img_rgb, kp_pixels, output_path)
 
 def draw_kp_map_simple(img_rgb: np.ndarray, kp_xy: torch.Tensor, path: str, mouth_idxs=None):
@@ -181,6 +193,9 @@ def draw_kp_map_simple(img_rgb: np.ndarray, kp_xy: torch.Tensor, path: str, mout
     if dir_name:
         os.makedirs(dir_name, exist_ok=True)
     canvas = img_rgb.copy()
+    if canvas.dtype != np.uint8:
+        canvas = np.clip(canvas, 0, 255).astype(np.uint8)
+    canvas_bgr = cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR)
     H, W = canvas.shape[:2]
     xy = kp_xy.detach().cpu().numpy()
     x = xy[:, 0]
@@ -205,30 +220,48 @@ def draw_kp_map_simple(img_rgb: np.ndarray, kp_xy: torch.Tensor, path: str, mout
             )
     cv2.imwrite(path, cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR))
 
-def draw_mouth_vectors(img_rgb: np.ndarray, kp_xy: torch.Tensor, delta: torch.Tensor, mouth_mask: torch.Tensor, path: str, scale_px: float=180.0):
-    """Plot motion vectors on mouth keypoints only."""
-    import cv2, numpy as np
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+def draw_mouth_vectors(
+    img_rgb: np.ndarray,
+    kp_pixels: np.ndarray | torch.Tensor,
+    delta: torch.Tensor,
+    mouth_mask: torch.Tensor,
+    path: str,
+    scale_px: float = 320.0,
+    min_arrow_px: float = 6.0,
+) -> None:
+    """Plot motion vectors on mouth keypoints using pixel-space coordinates."""
+    dir_name = os.path.dirname(path)
+    if dir_name:
+        os.makedirs(dir_name, exist_ok=True)
     canvas = img_rgb.copy()
-    H, W = canvas.shape[:2]
-    xy = kp_xy.detach().cpu().numpy()
-    d  = delta.detach().cpu().numpy()  # (N,3)
-    x = xy[:,0]; y = xy[:,1]
-    # normalize to image box
-    x_ = (x - x.min()) / max(1e-6, (x.max() - x.min()))
-    y_ = (y - y.min()) / max(1e-6, (y.max() - y.min()))
-    px = (x_ * (W-1)).astype(np.int32)
-    py = (y_ * (H-1)).astype(np.int32)
+    if canvas.dtype != np.uint8:
+        canvas = np.clip(canvas, 0, 255).astype(np.uint8)
+    canvas_bgr = cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR)
 
+    if isinstance(kp_pixels, torch.Tensor):
+        pts = kp_pixels.detach().cpu().numpy()
+    else:
+        pts = np.asarray(kp_pixels, dtype=np.float32)
+    d = delta.detach().cpu().numpy()
     mouth_idx = np.nonzero(mouth_mask.detach().cpu().numpy())[0]
     for i in mouth_idx:
-        u, v = int(px[i]), int(py[i])
-        du = int(d[i,0] * scale_px)
-        dv = int(d[i,1] * scale_px)
-        cv2.arrowedLine(canvas, (u,v), (u+du, v+dv), (0,180,255), 2, tipLength=0.25)
-        cv2.circle(canvas, (u,v), 2, (255,255,255), -1, lineType=cv2.LINE_AA)
+        u = float(pts[i, 0])
+        v = float(pts[i, 1])
+        du = float(d[i, 0]) * float(scale_px)
+        dv = float(d[i, 1]) * float(scale_px)
+        mag = math.hypot(du, dv)
+        if mag < 1e-6:
+            continue
+        if mag < float(min_arrow_px):
+            scale = float(min_arrow_px) / (mag + 1e-8)
+            du *= scale
+            dv *= scale
+        start = (int(round(u)), int(round(v)))
+        end = (int(round(u + du)), int(round(v + dv)))
+        # Use a bright orange arrow to visualize motion without an additional dot
+        cv2.arrowedLine(canvas_bgr, start, end, (0, 140, 255), 2, tipLength=0.25)
 
-    cv2.imwrite(path, cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR))
+    cv2.imwrite(path, canvas_bgr)
 # ===============================================================
 
 # ====== DIAGNOSTICS HELPERS ======
@@ -391,11 +424,13 @@ def main(
 
     # A) Save a target keypoint map using the unified projection logic
     os.makedirs("outputs/diagnostics", exist_ok=True)
+    target_kp_pixels = project_keypoints_to_image(wrap, T_kp, target_rgb)
     save_keypoint_map(
         wrap,
         target_rgb,
         T_kp,
         "outputs/diagnostics/target_keypoint_map.jpg",
+        kp_pixels=target_kp_pixels,
     )
 
     # -------- Auto flip donor to best match target pose (optional) --------
@@ -719,13 +754,19 @@ def main(
     # D) Vector plot of current delta on mouth points only (after S3+ downstream edits)
     if mouth_mask is not None:
         try:
+            mouth_delta = exp_delta[0, mouth_mask, :]
+            if mouth_delta.numel() == 0:
+                print("[viz] mouth_vectors skipped: mouth_mask empty")
+            else:
+                mags = mouth_delta.norm(dim=1)
+                print(f"[viz] mouth_vectors stats -> mean|d|={mags.mean().item():.6f}, max|d|={mags.max().item():.6f}")
             draw_mouth_vectors(
                 target_rgb,
-                kp_can_t[:, :2],
+                target_kp_pixels,
                 exp_delta[0, :, :].clamp(-1.0, 1.0),  # avoid NaNs/huge values
                 mouth_mask,
                 "outputs/diagnostics/mouth_vectors.jpg",
-                scale_px=260.0  # bump a bit so short motions still show
+                scale_px=360.0,  # bump a bit so short motions still show
             )
         except Exception as e:
             print("[viz] mouth_vectors skip:", e)
@@ -797,7 +838,7 @@ def main(
         return float(n / b)
 
     r_corners = _region_ratio(S1, exp_delta, corner_mask_fin)
-    print(f"[ACCEPTANCE] Corner Y retention vs S1: {r_corners*100:.1f}% (target ≥60–80%)")
+    print(f"[ACCEPTANCE] Corner Y retention vs S1: {r_corners*100:.1f}% (target >=60-80%)")
 
 if __name__ == "__main__":
     import argparse
