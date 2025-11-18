@@ -279,7 +279,7 @@ def _summ_stats(vec: torch.Tensor) -> Dict[str, float]:
 
 def log_stage(stage_name: str, exp_delta: torch.Tensor, mask_dict: Dict[str, torch.Tensor]):
     """Print stats for X and Y on lip/corner masks."""
-    print(f"\n[STAGE {stage_name}]")
+    # print(f"\n[STAGE {stage_name}]")
     for k in ["lips_mask", "corner_mask", "center_lip_mask"]:
         if k not in mask_dict:
             continue
@@ -287,14 +287,14 @@ def log_stage(stage_name: str, exp_delta: torch.Tensor, mask_dict: Dict[str, tor
         n = int(m.sum().item())
         idx_show = torch.nonzero(m, as_tuple=False).squeeze(-1).tolist()
         idx_show = idx_show[:8] if isinstance(idx_show, list) else []
-        print(f" - {k}: count={n} examples={idx_show}")
+        # print(f" - {k}: count={n} examples={idx_show}")
         if n > 0:
             dx = exp_delta[0, m, 0]
             dy = exp_delta[0, m, 1]
             sx = _summ_stats(dx)
             sy = _summ_stats(dy)
-            print(f" X: mean={sx['mean']:.5f} med={sx['median']:.5f} max|.|={sx['max']:.5f} p05={sx['p05']:.5f} p95={sx['p95']:.5f}")
-            print(f" Y: mean={sy['mean']:.5f} med={sy['median']:.5f} max|.|={sy['max']:.5f} p05={sy['p05']:.5f} p95={sy['p95']:.5f}")
+            # print(f" X: mean={sx['mean']:.5f} med={sx['median']:.5f} max|.|={sx['max']:.5f} p05={sx['p05']:.5f} p95={sx['p95']:.5f}")
+            # print(f" Y: mean={sy['mean']:.5f} med={sy['median']:.5f} max|.|={sy['max']:.5f} p05={sy['p05']:.5f} p95={sy['p95']:.5f}")
 
 def draw_masks_overlay(img_rgb: np.ndarray, kpts_xy: torch.Tensor, masks: Dict[str, torch.Tensor], path: str):
     """Save a quick overlay to verify mouth coverage."""
@@ -437,7 +437,7 @@ def main(
     flip_used = False
     if auto_flip:
         donor_rgb, flip_used = choose_best_flip(wrap, donor_rgb, kp_can_t_xy)
-        print(f"[auto_flip] Using {'FLIPPED' if flip_used else 'ORIGINAL'} donor orientation.")
+        # print(f"[auto_flip] Using {'FLIPPED' if flip_used else 'ORIGINAL'} donor orientation.")
 
     # donor LR delta via flip and map back
     E_donor = get_exp_tensor(wrap, donor_rgb)
@@ -462,11 +462,11 @@ def main(
     exp_delta = raw_delta * float(scale) if side == "right" else -raw_delta * float(scale)
 
     pre_norm = exp_delta.detach().float().norm().item()
-    print("\n=== ASYMMETRY DETECTION ===")
-    print(f"Raw delta magnitude: {raw_delta.abs().mean().item():.6f}")
-    print(f"Max delta: {raw_delta.abs().max().item():.6f}")
-    print(f"Delta X range: [{raw_delta[0,:,0].min():.4f}, {raw_delta[0,:,0].max():.4f}]")
-    print(f"Delta Y range: [{raw_delta[0,:,1].min():.4f}, {raw_delta[0,:,1].max():.4f}]")
+    # print("\n=== ASYMMETRY DETECTION ===")
+    # print(f"Raw delta magnitude: {raw_delta.abs().mean().item():.6f}")
+    # print(f"Max delta: {raw_delta.abs().max().item():.6f}")
+    # print(f"Delta X range: [{raw_delta[0,:,0].min():.4f}, {raw_delta[0,:,0].max():.4f}]")
+    # print(f"Delta Y range: [{raw_delta[0,:,1].min():.4f}, {raw_delta[0,:,1].max():.4f}]")
 
     # S0
     S0 = exp_delta.clone()
@@ -627,9 +627,10 @@ def main(
         log_stage("S3 (after gains + soft-knee)", exp_delta, masks_dict)
         try:
             draw_masks_overlay(target_rgb, kp_can_t[:, :2], masks_dict, "outputs/diagnostics/kp_masks.jpg")
-            print("  [viz] saved outputs/diagnostics/kp_masks.jpg")
+            # print("  [viz] saved outputs/diagnostics/kp_masks.jpg")
         except Exception as e:
-            print("  [viz] skip:", e)
+            # print("  [viz] skip:", e)
+            pass
 
         mouth_mask = lips_mask | corner_mask
         mouth_idx_list = torch.nonzero(mouth_mask, as_tuple=False).squeeze(-1).cpu().tolist()
@@ -639,7 +640,43 @@ def main(
             mouth_idx_list = torch.nonzero(mouth_mask, as_tuple=False).squeeze(-1).cpu().tolist()
 
         draw_kp_map_simple(target_rgb, kp_can_t[:, :2], "outputs/diagnostics/target_kp_mouth_labeled.jpg", mouth_idxs=set(mouth_idx_list))
-        print("[diag] mouth keypoint indices:", mouth_idx_list)
+        # print("[diag] mouth keypoint indices:", mouth_idx_list)
+
+    def _save_mouth_vectors(tag: str, delta_tensor: torch.Tensor, out_path: str):
+        if mouth_mask is None:
+            return
+        try:
+            mouth_delta = delta_tensor[0, mouth_mask, :]
+            if mouth_delta.numel() == 0:
+                print(f"[viz] mouth_vectors {tag} skipped: mouth_mask empty")
+                return
+            mags = mouth_delta.norm(dim=1)
+            print(f"[viz] mouth_vectors {tag} -> mean|d|={mags.mean().item():.6f}, max|d|={mags.max().item():.6f}")
+            draw_mouth_vectors(
+                target_rgb,
+                target_kp_pixels,
+                delta_tensor[0, :, :].clamp(-1.0, 1.0),
+                mouth_mask,
+                out_path,
+                scale_px=360.0,
+            )
+            print(f"[viz] saved {out_path}")
+        except Exception as e:
+            print(f"[viz] mouth_vectors {tag} skip:", e)
+
+    def _log_vertical_metrics(tag: str, delta_tensor: torch.Tensor, stable_mask: torch.Tensor, mouth_like_mask: torch.Tensor):
+        dy = delta_tensor[0, :, 1]
+        def _metrics(mask, name):
+            if mask is None or (not mask.any()):
+                print(f"[guard] {tag} {name}: no samples")
+                return
+            sel = dy[mask]
+            mean_abs = sel.abs().mean().item()
+            max_abs = sel.abs().max().item()
+            mean_signed = sel.mean().item()
+            print(f"[guard] {tag} {name}: mean|dy|={mean_abs:.6f} max|dy|={max_abs:.6f} mean(dy)={mean_signed:.6f}")
+        _metrics(stable_mask, "stable")
+        _metrics(mouth_like_mask, "mouth")
 
     # --- Vertical drift guard & top/bottom anchoring ---
     # Recompute yn using target keypoints (outside no_grad for clarity)
@@ -682,6 +719,8 @@ def main(
         "corner_mask": corner_mask_log,
         "center_lip_mask": center_lip_mask_log
     })
+    _log_vertical_metrics("post_y_drift_fix", exp_delta, stable, ~stable)
+    _save_mouth_vectors("pre_y_anchor", exp_delta, "outputs/diagnostics/mouth_vectors_pre_y_anchor.jpg")
 
     # Anchor extremes to avoid vertical squash/stretch
     if float(y_anchor) > 0.0:
@@ -697,6 +736,8 @@ def main(
         "corner_mask": corner_mask_log,
         "center_lip_mask": center_lip_mask_log
     })
+    _log_vertical_metrics("post_y_anchor", exp_delta, stable, ~stable)
+    _save_mouth_vectors("post_y_anchor", exp_delta, "outputs/diagnostics/mouth_vectors_post_y_anchor.jpg")
 
     # kill residual global widening in X (affine detrend)
     dx = exp_delta[0, :, 0]
@@ -752,24 +793,8 @@ def main(
     })
 
     # D) Vector plot of current delta on mouth points only (after S3+ downstream edits)
-    if mouth_mask is not None:
-        try:
-            mouth_delta = exp_delta[0, mouth_mask, :]
-            if mouth_delta.numel() == 0:
-                print("[viz] mouth_vectors skipped: mouth_mask empty")
-            else:
-                mags = mouth_delta.norm(dim=1)
-                print(f"[viz] mouth_vectors stats -> mean|d|={mags.mean().item():.6f}, max|d|={mags.max().item():.6f}")
-            draw_mouth_vectors(
-                target_rgb,
-                target_kp_pixels,
-                exp_delta[0, :, :].clamp(-1.0, 1.0),  # avoid NaNs/huge values
-                mouth_mask,
-                "outputs/diagnostics/mouth_vectors.jpg",
-                scale_px=360.0,  # bump a bit so short motions still show
-            )
-        except Exception as e:
-            print("[viz] mouth_vectors skip:", e)
+    _save_mouth_vectors("final", exp_delta, "outputs/diagnostics/mouth_vectors.jpg")
+    _log_vertical_metrics("final", exp_delta, stable, ~stable)
 
     # ---- global motion cap allowing amplification up to pre_norm * norm_cap
     post_norm = exp_delta.detach().float().norm().item()
@@ -813,22 +838,22 @@ def main(
 
     # final output
     save_rgb(out_path, img_asym_lb)
-    print("[OK]", out_path)
+    # print("[OK]", out_path)
 
-    print("\n=== FINAL DELTA ===")
-    print(f"Final delta magnitude: {exp_delta.abs().mean().item():.6f}")
-    print(f"Pre-norm: {pre_norm:.4f}, Post-norm: {post_norm:.4f}, Cap: {cap:.4f}")
+    # print("\n=== FINAL DELTA ===")
+    # print(f"Final delta magnitude: {exp_delta.abs().mean().item():.6f}")
+    # print(f"Pre-norm: {pre_norm:.4f}, Post-norm: {post_norm:.4f}, Cap: {cap:.4f}")
 
-    # Final lip/corner stats and acceptance vs S1
+    # # Final lip/corner stats and acceptance vs S1
     masks_fin = compute_masks(kp_can_t)
     lips_mask_fin = masks_fin["lips_mask"]
     corner_mask_fin = masks_fin["corner_mask"]
-    if lips_mask_fin.any():
-        lip_delta_y = exp_delta[0, lips_mask_fin, 1].abs()
-        print(f"Lip Y |mean|={lip_delta_y.mean():.6f} |max|={lip_delta_y.max():.6f}")
-    if corner_mask_fin.any():
-        corner_delta_y = exp_delta[0, corner_mask_fin, 1].abs()
-        print(f"Corner Y |mean|={corner_delta_y.mean():.6f} |max|={corner_delta_y.max():.6f}")
+    # if lips_mask_fin.any():
+    #     lip_delta_y = exp_delta[0, lips_mask_fin, 1].abs()
+    #     print(f"Lip Y |mean|={lip_delta_y.mean():.6f} |max|={lip_delta_y.max():.6f}")
+    # if corner_mask_fin.any():
+    #     corner_delta_y = exp_delta[0, corner_mask_fin, 1].abs()
+    #     print(f"Corner Y |mean|={corner_delta_y.mean():.6f} |max|={corner_delta_y.max():.6f}")
 
     def _region_ratio(base: torch.Tensor, now: torch.Tensor, m: torch.Tensor) -> float:
         if not m.any():
@@ -838,7 +863,7 @@ def main(
         return float(n / b)
 
     r_corners = _region_ratio(S1, exp_delta, corner_mask_fin)
-    print(f"[ACCEPTANCE] Corner Y retention vs S1: {r_corners*100:.1f}% (target >=60-80%)")
+    # print(f"[ACCEPTANCE] Corner Y retention vs S1: {r_corners*100:.1f}% (target >=60-80%)")
 
 if __name__ == "__main__":
     import argparse
