@@ -2,20 +2,19 @@ import sys, os, os.path as osp, cv2, torch, math
 import numpy as np
 from typing import Dict
 
-# make "src" importable when running from scripts/
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from src.config.inference_config import InferenceConfig
 from src.live_portrait_wrapper import LivePortraitWrapper
 
 def read_rgb(p):
-    # Read an image from disk as RGB
+    # Read an image as RGB
     img = cv2.imread(p, cv2.IMREAD_COLOR)
     if img is None:
         raise FileNotFoundError(p)
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 def save_rgb(p, img_rgb):
-    # Save an RGB image to disk, mkdir as needed
+    # Save RBG image
     os.makedirs(osp.dirname(p), exist_ok=True)
     cv2.imwrite(p, cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR))
 
@@ -35,11 +34,6 @@ def letterbox_to(img_rgb: np.ndarray, out_w: int, out_h: int) -> np.ndarray:
     return canvas
 
 def resolve_output_size(target_rgb: np.ndarray, out_w: int, out_h: int):
-    """ Decide final output size
-    - If neither width nor height provided: use target image size
-    - If one side provided: compute the other to preserve target aspect
-    - If both provided: use them as is
-    """
     Ht, Wt = target_rgb.shape[:2]
     if out_w <= 0 and out_h <= 0:
         return Wt, Ht
@@ -50,9 +44,6 @@ def resolve_output_size(target_rgb: np.ndarray, out_w: int, out_h: int):
     return out_w, out_h
 
 def procrustes_scale(src_xy: torch.Tensor, dst_xy: torch.Tensor) -> float:
-    """ Compute the best-fit similarity *scale* that maps src->dst (least-squares)
-    Only keep the scalar (zoom). Adjusts for different zooms in X/Y
-    """
     src = src_xy - src_xy.mean(dim=0, keepdim=True)
     dst = dst_xy - dst_xy.mean(dim=0, keepdim=True)
     src_norm = torch.linalg.norm(src)
@@ -62,42 +53,42 @@ def procrustes_scale(src_xy: torch.Tensor, dst_xy: torch.Tensor) -> float:
     return float((dst_norm / (src_norm + 1e-8)).item())
 
 def similarity_decompose(src_xy: torch.Tensor, dst_xy: torch.Tensor):
-    # Compute best-fit 2x2 rotation matrix. Adjusts for rotation in X/Y
+    # Compute best-fit 2x2 rotation matrix and adjust rotation
     src = src_xy - src_xy.mean(dim=0, keepdim=True)
     dst = dst_xy - dst_xy.mean(dim=0, keepdim=True)
     H = src.T @ dst
     U, S, Vt = torch.linalg.svd(H)
     R = U @ Vt
-    if torch.det(R) < 0:  # handle reflections to keep a proper rotation
+    if torch.det(R) < 0:
         Vt[-1, :] *= -1
         R = U @ Vt
     theta = float(torch.atan2(R[1, 0], R[0, 0]).item())
     return R, theta
 
 def affine_detrend_dx(dx: torch.Tensor, kp_xy: torch.Tensor):
-    # Remove global widening from X motion by fitting: dx ≈ a*(x-xc) + b*(y-yc) + c and subtracting it off
+    # Remove global widening from X motion by fitting: dx ~ a*(x-xc) + b*(y-yc) + c and subtracting it off
     x = kp_xy[:, 0]; y = kp_xy[:, 1]
     xc = x.mean(); yc = y.mean()
-    X = torch.stack([x - xc, y - yc, torch.ones_like(x)], dim=1)  # (N,3)
-    coeff = torch.linalg.pinv(X) @ dx  # (3,)
-    trend = X @ coeff  # (N,)
+    X = torch.stack([x - xc, y - yc, torch.ones_like(x)], dim=1)
+    coeff = torch.linalg.pinv(X) @ dx
+    trend = X @ coeff
     return dx - trend, coeff
 
 def affine_detrend_dy(dy: torch.Tensor, kp_xy: torch.Tensor):
-    # Remove global vertical drift/scale/shear in Y: dy ≈ a*(x-xc) + b*(y-yc) + c
+    # Remove global vertical drift/scale/shear in Y: dy ~ a*(x-xc) + b*(y-yc) + c
     x = kp_xy[:, 0]; y = kp_xy[:, 1]
     xc = x.mean(); yc = y.mean()
-    X = torch.stack([x - xc, y - yc, torch.ones_like(x)], dim=1)  # (N,3)
-    coeff = torch.linalg.pinv(X) @ dy  # (3,)
+    X = torch.stack([x - xc, y - yc, torch.ones_like(x)], dim=1)
+    coeff = torch.linalg.pinv(X) @ dy
     trend = X @ coeff
     return dy - trend, coeff
 
 def soft_knee_vec(V: torch.Tensor, tau: float) -> torch.Tensor:
     # Compress vector magnitudes to avoid extreme values
-    # m' = tau * tanh(m / tau) -> behaves linear for small m, saturates for big m
-    m = torch.linalg.norm(V, dim=-1, keepdim=True) + 1e-8  # per keypoint motion magnitude
+    # m' = tau * tanh(m / tau)
+    m = torch.linalg.norm(V, dim=-1, keepdim=True) + 1e-8
     m_prime = float(tau) * torch.tanh(m / float(tau))
-    gain = (m_prime / m).clamp(max=1.0)  # dont amplify
+    gain = (m_prime / m).clamp(max=1.0)
     return V * gain
 
 def soft_knee_scalar(d: torch.Tensor, tau: float) -> torch.Tensor:
@@ -107,7 +98,6 @@ def soft_knee_scalar(d: torch.Tensor, tau: float) -> torch.Tensor:
     return torch.sign(d) * a_prime
 
 def kp_to_pixels(kp_xy: torch.Tensor | np.ndarray, height: int, width: int) -> np.ndarray:
-    """Convert normalized [-1, 1] coords (or already-pixel coords) into pixel space."""
     if isinstance(kp_xy, torch.Tensor):
         xy = kp_xy.detach().float().cpu().numpy()
     else:
@@ -160,7 +150,6 @@ def project_keypoints_to_image(
     kp_info: Dict[str, torch.Tensor],
     img_rgb: np.ndarray,
 ) -> np.ndarray:
-    """Return pixel-space keypoints using the same projection as keypoint_map.py."""
     if img_rgb is None or kp_info is None:
         raise ValueError("img_rgb and kp_info must be provided for keypoint visualization.")
     src_h, src_w = img_rgb.shape[:2]
@@ -182,13 +171,11 @@ def save_keypoint_map(
     output_path: str,
     kp_pixels: np.ndarray | torch.Tensor | None = None,
 ) -> None:
-    """Match keypoint_map.py logic by projecting canonical keypoints back to the image."""
     if kp_pixels is None:
         kp_pixels = project_keypoints_to_image(wrapper, kp_info, img_rgb)
     draw_keypoint_map(img_rgb, kp_pixels, output_path)
 
 def draw_kp_map_simple(img_rgb: np.ndarray, kp_xy: torch.Tensor, path: str, mouth_idxs=None):
-    """Diagnostic-only normalized map with optional mouth annotations."""
     dir_name = os.path.dirname(path)
     if dir_name:
         os.makedirs(dir_name, exist_ok=True)
@@ -229,7 +216,6 @@ def draw_mouth_vectors(
     scale_px: float = 320.0,
     min_arrow_px: float = 6.0,
 ) -> None:
-    """Plot motion vectors on mouth keypoints using pixel-space coordinates."""
     dir_name = os.path.dirname(path)
     if dir_name:
         os.makedirs(dir_name, exist_ok=True)
@@ -258,13 +244,10 @@ def draw_mouth_vectors(
             dv *= scale
         start = (int(round(u)), int(round(v)))
         end = (int(round(u + du)), int(round(v + dv)))
-        # Use a bright orange arrow to visualize motion without an additional dot
+        # Use an orange arrow to visualize motion
         cv2.arrowedLine(canvas_bgr, start, end, (0, 140, 255), 2, tipLength=0.25)
 
     cv2.imwrite(path, canvas_bgr)
-# ===============================================================
-
-# ====== DIAGNOSTICS HELPERS ======
 def _pct(a: torch.Tensor, q: float):
     return torch.quantile(a, torch.tensor(q, device=a.device))
 
@@ -278,8 +261,6 @@ def _summ_stats(vec: torch.Tensor) -> Dict[str, float]:
     }
 
 def log_stage(stage_name: str, exp_delta: torch.Tensor, mask_dict: Dict[str, torch.Tensor]):
-    """Print stats for X and Y on lip/corner masks."""
-    # print(f"\n[STAGE {stage_name}]")
     for k in ["lips_mask", "corner_mask", "center_lip_mask"]:
         if k not in mask_dict:
             continue
@@ -287,17 +268,12 @@ def log_stage(stage_name: str, exp_delta: torch.Tensor, mask_dict: Dict[str, tor
         n = int(m.sum().item())
         idx_show = torch.nonzero(m, as_tuple=False).squeeze(-1).tolist()
         idx_show = idx_show[:8] if isinstance(idx_show, list) else []
-        # print(f" - {k}: count={n} examples={idx_show}")
         if n > 0:
             dx = exp_delta[0, m, 0]
             dy = exp_delta[0, m, 1]
             sx = _summ_stats(dx)
             sy = _summ_stats(dy)
-            # print(f" X: mean={sx['mean']:.5f} med={sx['median']:.5f} max|.|={sx['max']:.5f} p05={sx['p05']:.5f} p95={sx['p95']:.5f}")
-            # print(f" Y: mean={sy['mean']:.5f} med={sy['median']:.5f} max|.|={sy['max']:.5f} p05={sy['p05']:.5f} p95={sy['p95']:.5f}")
-
 def draw_masks_overlay(img_rgb: np.ndarray, kpts_xy: torch.Tensor, masks: Dict[str, torch.Tensor], path: str):
-    """Save a quick overlay to verify mouth coverage."""
     color_map = {
         "eyes_mask": (255, 200, 0),
         "brows_mask": (255, 100, 0),
@@ -361,7 +337,7 @@ def choose_best_flip(wrap, donor_rgb, target_kp_xy):
     D2 = wrap.prepare_source(donor_flip)
     kp2 = wrap.get_kp_info(D2, flag_refine_info=True)["kp"][0][:, :2]
     kp2 = kp2.clone()
-    kp2[:, 0] *= -1  # mirror canonical X for flipped donor
+    kp2[:, 0] *= -1
 
     # compare after Procrustes scale + rotation align
     def _align_dist(a, b):
@@ -397,10 +373,10 @@ def main(
     lip_gain_x=None,
     lip_gain_y=None,
     corner_gain=1.6,
-    norm_cap=2.5,  # NEW:
+    norm_cap=2.5,
     mouth_sym_alpha=0.0,
-    y_drift_fix="nonmouth",  # "none" | "global" | "nonmouth"
-    y_anchor=0.5,  # 0..1
+    y_drift_fix="nonmouth",
+    y_anchor=0.5,
     # control how much of the nonmouth bias we subtract from mouth Y (0=keep mouth free)
     y_drift_mouth_bias: float = 0.0,
 ):
@@ -415,14 +391,13 @@ def main(
     # get target keypoints in canonical coords to define left/right etc
     T = wrap.prepare_source(target_rgb)
     T_kp = wrap.get_kp_info(T, flag_refine_info=True)
-    kp_can_t = T_kp["kp"][0]  # (N,3)
+    kp_can_t = T_kp["kp"][0]
     kp_can_t_xy = kp_can_t[:, :2]
     x_can = kp_can_t[:, 0]
     x_center = x_can.mean()
     left_mask = x_can < x_center
     right_mask = ~left_mask
 
-    # A) Save a target keypoint map using the unified projection logic
     os.makedirs("outputs/diagnostics", exist_ok=True)
     target_kp_pixels = project_keypoints_to_image(wrap, T_kp, target_rgb)
     save_keypoint_map(
@@ -433,11 +408,9 @@ def main(
         kp_pixels=target_kp_pixels,
     )
 
-    # -------- Auto flip donor to best match target pose (optional) --------
     flip_used = False
     if auto_flip:
         donor_rgb, flip_used = choose_best_flip(wrap, donor_rgb, kp_can_t_xy)
-        # print(f"[auto_flip] Using {'FLIPPED' if flip_used else 'ORIGINAL'} donor orientation.")
 
     # donor LR delta via flip and map back
     E_donor = get_exp_tensor(wrap, donor_rgb)
@@ -445,7 +418,7 @@ def main(
     E_flip = get_exp_tensor(wrap, donor_flip)
     E_flip_map = E_flip.clone(); E_flip_map[..., 0] *= -1
 
-    # B) Visualize donor keypoints too
+    # Visualize donor keypoints
     D = wrap.prepare_source(donor_rgb)
     D_kp = wrap.get_kp_info(D, flag_refine_info=True)
     kp_can_d = D_kp["kp"][0]
@@ -456,23 +429,15 @@ def main(
         "outputs/diagnostics/donor_keypoint_map.jpg",
     )
 
-    # Canonical LR delta (right-minus-left). Use flag to choose sign.
-    raw_delta = (E_donor - E_flip_map)  # right minus left, canonical
+    # Canonical LR delta (right-minus-left) Use CLI to decide sign
+    raw_delta = (E_donor - E_flip_map)
     side = asym_side.lower()
     exp_delta = raw_delta * float(scale) if side == "right" else -raw_delta * float(scale)
 
     pre_norm = exp_delta.detach().float().norm().item()
-    # print("\n=== ASYMMETRY DETECTION ===")
-    # print(f"Raw delta magnitude: {raw_delta.abs().mean().item():.6f}")
-    # print(f"Max delta: {raw_delta.abs().max().item():.6f}")
-    # print(f"Delta X range: [{raw_delta[0,:,0].min():.4f}, {raw_delta[0,:,0].max():.4f}]")
-    # print(f"Delta Y range: [{raw_delta[0,:,1].min():.4f}, {raw_delta[0,:,1].max():.4f}]")
-
-    # S0
     S0 = exp_delta.clone()
 
     # normalize donor vs target pose/size in canonical space
-    # (recompute donor kp here as float and use for alignment)
     kp_can_d_xy = kp_can_d[:, :2]
     # scale (zoom) match
     s_ratio = procrustes_scale(kp_can_d_xy, kp_can_t_xy)
@@ -481,14 +446,7 @@ def main(
     R, _theta = similarity_decompose(kp_can_d_xy, kp_can_t_xy)
     R = R.to(dtype=exp_delta.dtype, device=exp_delta.device)
     exp_delta[0, :, 0:2] = exp_delta[0, :, 0:2] @ R
-
-    # S1
     S1 = exp_delta.clone()
-
-    """ Keep motion concentrated around the middle of the face
-    Cheeks tend to “swell/widen” if outer landmarks move laterally
-    This weights X-motion down toward the edges
-    """
     with torch.no_grad():
         xy = kp_can_t[:, :2]
         cx, cy = xy.mean(dim=0)
@@ -498,22 +456,18 @@ def main(
 
         sig_x = 0.95
         sig_y = 0.90
-        w_roi = torch.exp(-0.5*((dxn/(sig_x*sx))**2 + (dyn/(sig_y*sy))**2))  # (N,)
+        w_roi = torch.exp(-0.5*((dxn/(sig_x*sx))**2 + (dyn/(sig_y*sy))**2))
         w_roi = 0.25 + 0.75*w_roi
-        exp_delta[0,:,0] *= w_roi  # only X (sideways)
-
-        # fully zero X on the outer ~12% of face width (hard guardrail)
+        exp_delta[0,:,0] *= w_roi
         span_x = (kp_can_t[:,0] - kp_can_t[:,0].mean()).abs().max() + 1e-6
         edge_thresh = 0.88
         edge_mask = ((kp_can_t[:,0] - kp_can_t[:,0].mean()).abs() / span_x) > edge_thresh
         if int(edge_mask.sum()) > 0:
             exp_delta[0, edge_mask, 0] = 0.0
-
-    # S2
     S2 = exp_delta.clone()
 
-    # ---------------- Region-specific control (ADAPTIVE) ----------------
-    mouth_mask = None  # will fill in and reuse later
+    # region specific control
+    mouth_mask = None
     with torch.no_grad():
         xy = kp_can_t[:, :2].to(exp_delta.device, exp_delta.dtype)
         cx, cy = xy.mean(dim=0)
@@ -525,9 +479,7 @@ def main(
         # Normalized coords (zero-mean, unit-ish std)
         xn = dxn / sx
         yn = dyn / sy
-
-        # ---- ADAPTIVE MOUTH BANDS (quantile-based instead of fixed numbers) ----
-        # choose the lower-mid vertical band as "mouth zone" and allow corners a wider |x|
+        # Horizontal band for mouth region
         y_lo = torch.quantile(yn, torch.tensor(0.45, device=yn.device))
         y_hi = torch.quantile(yn, torch.tensor(0.95, device=yn.device))
 
@@ -539,46 +491,43 @@ def main(
         corner_mask     = (yn >= y_lo) & (yn <= y_hi) & (xn.abs() >  x_mid) & (xn.abs() <= x_wide)
         center_lip_mask = (yn >= y_lo) & (yn <= y_hi) & (xn.abs() <= (0.6 * x_mid))
 
-        # --- Robust fallback if selection is too small (some faces/chkpts bunch up) ---
         if int(lips_mask.sum()) < 6:
             # widen vertically and horizontally until we get a reasonable set
             y_lo_f = torch.quantile(yn, torch.tensor(0.40, device=yn.device))
             y_hi_f = torch.quantile(yn, torch.tensor(0.98, device=yn.device))
             x_mid_f  = torch.quantile(xn.abs(), torch.tensor(0.75, device=xn.device))
             x_wide_f = torch.quantile(xn.abs(), torch.tensor(0.97, device=xn.device))
-            lips_mask       = (yn >= y_lo_f) & (yn <= y_hi_f) & (xn.abs() <= x_mid_f)
-            corner_mask     = (yn >= y_lo_f) & (yn <= y_hi_f) & (xn.abs() > x_mid_f) & (xn.abs() <= x_wide_f)
+            lips_mask = (yn >= y_lo_f) & (yn <= y_hi_f) & (xn.abs() <= x_mid_f)
+            corner_mask = (yn >= y_lo_f) & (yn <= y_hi_f) & (xn.abs() > x_mid_f) & (xn.abs() <= x_wide_f)
             center_lip_mask = (yn >= y_lo_f) & (yn <= y_hi_f) & (xn.abs() <= (0.6 * x_mid_f))
 
         # Eyes / brows (leave as-is; cap to not exceed 1x)
-        eyes_mask     = (yn < torch.quantile(yn, torch.tensor(0.25, device=yn.device))) & (xn.abs() > torch.quantile(xn.abs(), torch.tensor(0.55, device=xn.device)))
-        brows_mask    = (yn < torch.quantile(yn, torch.tensor(0.15, device=yn.device))) & (xn.abs() > torch.quantile(xn.abs(), torch.tensor(0.45, device=xn.device)))
+        eyes_mask = (yn < torch.quantile(yn, torch.tensor(0.25, device=yn.device))) & (xn.abs() > torch.quantile(xn.abs(), torch.tensor(0.55, device=xn.device)))
+        brows_mask = (yn < torch.quantile(yn, torch.tensor(0.15, device=yn.device))) & (xn.abs() > torch.quantile(xn.abs(), torch.tensor(0.45, device=xn.device)))
         eye_brow_mask = eyes_mask | brows_mask
 
-        # Kelvin-style base curve
-        w_focus   = torch.exp(-0.5 * (xn**2 + yn**2))  # [0..1], peak at center
-        kelvin_vec = (float(boost_base_floor) + float(boost_focus_gain) * w_focus)
+        w_focus   = torch.exp(-0.5 * (xn**2 + yn**2))
+        k_vec = (float(boost_base_floor) + float(boost_focus_gain) * w_focus)
 
         # Region gains
-        g_eye   = float(eye_gain)
-        g_brow  = float(brow_gain)
-        g_lip   = float(lip_gain)
+        g_eye = float(eye_gain)
+        g_brow = float(brow_gain)
+        g_lip = float(lip_gain)
         g_lip_x = float(lip_gain_x) if lip_gain_x is not None else g_lip
         g_lip_y = float(lip_gain_y) if lip_gain_y is not None else g_lip
         g_corner = float(corner_gain)
 
         gains_xy = torch.ones((xy.shape[0], 2), dtype=exp_delta.dtype, device=exp_delta.device)
         eb = min(g_eye * g_brow, 1.0)
-        gains_xy[eye_brow_mask, 0] *= eb
-        gains_xy[eye_brow_mask, 1] *= eb
-        gains_xy[lips_mask,   0]  *= g_lip_x
-        gains_xy[lips_mask,   1]  *= g_lip_y
-        gains_xy[corner_mask, 0]  *= g_corner
-        gains_xy[corner_mask, 1]  *= g_corner
+        gains_xy[eye_brow_mask,0] *= eb
+        gains_xy[eye_brow_mask,1] *= eb
+        gains_xy[lips_mask,0] *= g_lip_x
+        gains_xy[lips_mask,1] *= g_lip_y
+        gains_xy[corner_mask,0] *= g_corner
+        gains_xy[corner_mask,1] *= g_corner
 
-        # do NOT Kelvin-dampen lips/corners
-        no_kelvin  = lips_mask | corner_mask
-        kelvin_vec = torch.where(no_kelvin, torch.ones_like(kelvin_vec), kelvin_vec)
+        no_k  = lips_mask | corner_mask
+        k_vec = torch.where(no_k, torch.ones_like(k_vec), k_vec)
 
         # Optional symmetric Y add-in at the center of the mouth
         if float(mouth_sym_alpha) > 0.0:
@@ -592,10 +541,10 @@ def main(
             exp_delta[0, mouth_mask_loc, 1] = exp_delta[0, mouth_mask_loc, 1] + add_y[mouth_mask_loc]
 
         # Apply base & XY gains
-        exp_delta[0, :, 0:2] = exp_delta[0, :, 0:2] * kelvin_vec.unsqueeze(-1) * gains_xy
+        exp_delta[0, :, 0:2] = exp_delta[0, :, 0:2] * k_vec.unsqueeze(-1) * gains_xy
 
         # Mouth-friendly soft-knee compression
-        V    = exp_delta[0]
+        V = exp_delta[0]
         mags = torch.linalg.norm(V, dim=-1)
         tau_v_all = float(torch.quantile(mags, torch.tensor(0.98, device=mags.device))) * 2.0
         tau_v = torch.full_like(mags, tau_v_all)
@@ -613,7 +562,7 @@ def main(
         a_prime = tau_x * torch.tanh(a / tau_x)
         V[:, 0] = torch.sign(dx) * a_prime
 
-        # Diagnostics + overlays
+        # Diagnostics 
         masks_dict = {
             "lips_mask":       lips_mask,
             "corner_mask":     corner_mask,
@@ -627,9 +576,7 @@ def main(
         log_stage("S3 (after gains + soft-knee)", exp_delta, masks_dict)
         try:
             draw_masks_overlay(target_rgb, kp_can_t[:, :2], masks_dict, "outputs/diagnostics/kp_masks.jpg")
-            # print("  [viz] saved outputs/diagnostics/kp_masks.jpg")
         except Exception as e:
-            # print("  [viz] skip:", e)
             pass
 
         mouth_mask = lips_mask | corner_mask
@@ -640,7 +587,6 @@ def main(
             mouth_idx_list = torch.nonzero(mouth_mask, as_tuple=False).squeeze(-1).cpu().tolist()
 
         draw_kp_map_simple(target_rgb, kp_can_t[:, :2], "outputs/diagnostics/target_kp_mouth_labeled.jpg", mouth_idxs=set(mouth_idx_list))
-        # print("[diag] mouth keypoint indices:", mouth_idx_list)
 
     def _save_mouth_vectors(tag: str, delta_tensor: torch.Tensor, out_path: str):
         if mouth_mask is None:
@@ -678,8 +624,6 @@ def main(
         _metrics(stable_mask, "stable")
         _metrics(mouth_like_mask, "mouth")
 
-    # --- Vertical drift guard & top/bottom anchoring ---
-    # Recompute yn using target keypoints (outside no_grad for clarity)
     xy_t = kp_can_t[:, :2].to(exp_delta.device, exp_delta.dtype)
     cx_t, cy_t = xy_t.mean(dim=0)
     dx_t = xy_t[:, 0] - cx_t
@@ -696,10 +640,10 @@ def main(
     dy = exp_delta[0, :, 1]
     if y_drift_fix != "none":
         if y_drift_fix == "nonmouth" and stable.any():
-            dy2, _ = affine_detrend_dy(dy, kp_can_t_xy)  # detrend using all points' geometry
-            # Compute the residual bias on stable landmarks ONLY
+            dy2, _ = affine_detrend_dy(dy, kp_can_t_xy)
+            # Compute the residual bias on stable landmarks only
             bias_stable = dy2[stable].mean()
-            # Apply bias to NON-MOUTH only; keep mouth Y free (or small fraction)
+            # Apply bias to non-mouth only
             exp_delta[0, stable, 1] = dy2[stable] - bias_stable
             mouth_mask_all = ~(stable)
             if float(y_drift_mouth_bias) != 0.0 and mouth_mask_all.any():
@@ -710,7 +654,6 @@ def main(
             dy2, _ = affine_detrend_dy(dy, kp_can_t_xy)
             exp_delta[0, :, 1] = dy2
 
-    # S4
     lips_mask_log = lips_mask2
     corner_mask_log = corner_mask2
     center_lip_mask_log = (xn_t.abs() < 0.18) & (yn > -0.05) & (yn < 0.45)
@@ -727,10 +670,9 @@ def main(
         yn_abs = yn.abs().clamp(0, 2.0)
         denom = yn_abs.max().clamp_min(1e-6)
         anchor = 1.0 - float(y_anchor) * (yn_abs / denom)
-        # do NOT anchor lips/corners to preserve dip—apply only to non-mouth
+        # skip anchoring lips or corners so the mouth stays lively
         exp_delta[0, stable, 1] = exp_delta[0, stable, 1] * anchor[stable]
 
-    # S5
     log_stage("S5 (after y_anchor)", exp_delta, {
         "lips_mask": lips_mask_log,
         "corner_mask": corner_mask_log,
@@ -739,12 +681,10 @@ def main(
     _log_vertical_metrics("post_y_anchor", exp_delta, stable, ~stable)
     _save_mouth_vectors("post_y_anchor", exp_delta, "outputs/diagnostics/mouth_vectors_post_y_anchor.jpg")
 
-    # kill residual global widening in X (affine detrend)
     dx = exp_delta[0, :, 0]
     dx, _coeff = affine_detrend_dx(dx, kp_can_t_xy)
     exp_delta[0, :, 0] = dx
 
-    # S6
     log_stage("S6 (after affine_detrend_dx)", exp_delta, {
         "lips_mask": lips_mask_log,
         "corner_mask": corner_mask_log,
@@ -757,14 +697,13 @@ def main(
         q = torch.quantile(dx.abs(), torch.tensor(float(clamp_q), device=dx.device))
         exp_delta[0, :, 0] = dx.clamp(min=-q, max=q)
 
-    # S7
     log_stage("S7 (after clamp_q)", exp_delta, {
         "lips_mask": lips_mask_log,
         "corner_mask": corner_mask_log,
         "center_lip_mask": center_lip_mask_log
     })
 
-    # per-side mean removal so left/right don’t drift apart on average
+    # per-side mean removal so left/right don't drift apart on average
     dx = exp_delta[0, :, 0]
     if (left_mask.any()):
         dx[left_mask] = dx[left_mask] - dx[left_mask].mean()
@@ -792,11 +731,9 @@ def main(
         "center_lip_mask": center_lip_mask_log
     })
 
-    # D) Vector plot of current delta on mouth points only (after S3+ downstream edits)
     _save_mouth_vectors("final", exp_delta, "outputs/diagnostics/mouth_vectors.jpg")
     _log_vertical_metrics("final", exp_delta, stable, ~stable)
 
-    # ---- global motion cap allowing amplification up to pre_norm * norm_cap
     post_norm = exp_delta.detach().float().norm().item()
     cap = float(pre_norm) * float(norm_cap)
     if (post_norm > cap) and (cap > 1e-8):
@@ -830,21 +767,16 @@ def main(
     img_asym_lb = letterbox_to(img_asym, out_w_res, out_h_res)
     donor_lb = letterbox_to(donor_rgb, out_w_res, out_h_res)
 
-    side_img = np.hstack([img_base_lb, img_asym_lb])  # target before/after
+    side_img = np.hstack([img_base_lb, img_asym_lb])
     cv2.imwrite("outputs/diagnostics/baseline_vs_asym.jpg", cv2.cvtColor(side_img, cv2.COLOR_RGB2BGR))
 
-    side_dr = np.hstack([donor_lb, img_asym_lb])  # donor vs result
+    side_dr = np.hstack([donor_lb, img_asym_lb])
     cv2.imwrite("outputs/diagnostics/donor_vs_result.jpg", cv2.cvtColor(side_dr, cv2.COLOR_RGB2BGR))
 
     # final output
     save_rgb(out_path, img_asym_lb)
-    # print("[OK]", out_path)
 
-    # print("\n=== FINAL DELTA ===")
-    # print(f"Final delta magnitude: {exp_delta.abs().mean().item():.6f}")
-    # print(f"Pre-norm: {pre_norm:.4f}, Post-norm: {post_norm:.4f}, Cap: {cap:.4f}")
 
-    # # Final lip/corner stats and acceptance vs S1
     masks_fin = compute_masks(kp_can_t)
     lips_mask_fin = masks_fin["lips_mask"]
     corner_mask_fin = masks_fin["corner_mask"]
@@ -863,11 +795,10 @@ def main(
         return float(n / b)
 
     r_corners = _region_ratio(S1, exp_delta, corner_mask_fin)
-    # print(f"[ACCEPTANCE] Corner Y retention vs S1: {r_corners*100:.1f}% (target >=60-80%)")
 
 if __name__ == "__main__":
     import argparse
-    ap = argparse.ArgumentParser(description="Left–Right asymmetry transfer (donor -> neutral target)")
+    ap = argparse.ArgumentParser(description="Left-Right asymmetry transfer (donor -> neutral target)")
     ap.add_argument("--donor","-d", required=True)
     ap.add_argument("--target","-t", required=True)
     ap.add_argument("--out","-o", default="outputs/asym_transfer.jpg")
@@ -890,14 +821,14 @@ if __name__ == "__main__":
     ap.add_argument("--lip_gain_y", type=float, default=None)
     ap.add_argument("--corner_gain", type=float, default=1.6)
     # Global motion cap control
-    ap.add_argument("--norm_cap", type=float, default=2.5, help="Allow total motion up to pre_norm * norm_cap (default 2.5). Use 1.0 to keep old behavior.")
+    ap.add_argument("--norm_cap", type=float, default=2.5)
     # Pose alignment
     ap.add_argument("--auto_flip", action="store_true")
     # --- NEW controls ---
-    ap.add_argument("--mouth_sym_alpha", type=float, default=0.0, help="Blend of donor symmetric Y motion on lips/corners (0..1). 0 = off.")
-    ap.add_argument("--y_drift_fix", type=str, default="nonmouth", choices=["none", "global", "nonmouth"], help="Remove vertical bias: 'global' removes overall mean; 'nonmouth' uses non-mouth landmarks.")
-    ap.add_argument("--y_anchor", type=float, default=0.5, help="0..1 damping toward very top/bottom landmarks to avoid vertical squash. 0=off.")
-    ap.add_argument("--y_drift_mouth_bias", type=float, default=0.0, help="Fraction of nonmouth vertical bias to subtract from mouth Y (0=do not subtract).")
+    ap.add_argument("--mouth_sym_alpha", type=float, default=0.0)
+    ap.add_argument("--y_drift_fix", type=str, default="nonmouth", choices=["none", "global", "nonmouth"])
+    ap.add_argument("--y_anchor", type=float, default=0.5)
+    ap.add_argument("--y_drift_mouth_bias", type=float, default=0.0)
 
     a = ap.parse_args()
     main(
