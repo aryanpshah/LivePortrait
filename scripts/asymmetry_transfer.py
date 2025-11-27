@@ -6,6 +6,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from src.config.inference_config import InferenceConfig
 from src.live_portrait_wrapper import LivePortraitWrapper
 
+# basic run command: python asym_transfer.py \--donor path/to/donor.jpg \--target path/to/target.jpg \--out outputs/asym_transfer.jpg
+
 def read_rgb(p):
     # Read an image as RGB
     img = cv2.imread(p, cv2.IMREAD_COLOR)
@@ -562,7 +564,7 @@ def main(
         a_prime = tau_x * torch.tanh(a / tau_x)
         V[:, 0] = torch.sign(dx) * a_prime
 
-        # Diagnostics 
+        # Diagnostics
         masks_dict = {
             "lips_mask":       lips_mask,
             "corner_mask":     corner_mask,
@@ -799,16 +801,24 @@ def main(
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description="Left-Right asymmetry transfer (donor -> neutral target)")
+    # donor image path
     ap.add_argument("--donor","-d", required=True)
+    # target image path
     ap.add_argument("--target","-t", required=True)
+    # output path
     ap.add_argument("--out","-o", default="outputs/asym_transfer.jpg")
+    # model config path
     ap.add_argument("--config", default="src/config/models.yaml")
     ap.add_argument("--scale", type=float, default=1.0)
     ap.add_argument("--edge_dampen", type=float, default=0.55)
+    # output width
     ap.add_argument("--out_w", type=int, default=0)
+    # output height
     ap.add_argument("--out_h", type=int, default=0)
     ap.add_argument("--asym_side", type=str, default="right", choices=["right","left"])
+    # Midline control
     ap.add_argument("--midline_eps", type=float, default=0.05)
+    # Extreme clamp control
     ap.add_argument("--clamp_q", type=float, default=0.90)
     # Region/boost controls
     ap.add_argument("--boost_base", type=float, default=0.50)
@@ -824,8 +834,9 @@ if __name__ == "__main__":
     ap.add_argument("--norm_cap", type=float, default=2.5)
     # Pose alignment
     ap.add_argument("--auto_flip", action="store_true")
-    # --- NEW controls ---
+    # Mouth symmetry blend (0=off)
     ap.add_argument("--mouth_sym_alpha", type=float, default=0.0)
+    # Y-drift correction
     ap.add_argument("--y_drift_fix", type=str, default="nonmouth", choices=["none", "global", "nonmouth"])
     ap.add_argument("--y_anchor", type=float, default=0.5)
     ap.add_argument("--y_drift_mouth_bias", type=float, default=0.0)
