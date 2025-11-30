@@ -1,12 +1,17 @@
 import sys, os, os.path as osp, cv2, torch, math
 import numpy as np
-from typing import Dict
+from typing import Dict, Optional
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from src.config.inference_config import InferenceConfig
 from src.live_portrait_wrapper import LivePortraitWrapper
 
 # basic run command: python asym_transfer.py \--donor path/to/donor.jpg \--target path/to/target.jpg \--out outputs/asym_transfer.jpg
+
+# Fixed mouth indices from labeled diagnostic map
+LIP_IDX = [5, 17, 20, 18, 19]       # all mouth border points
+LIP_CORNER_IDX = [5, 18]           # left and right mouth corners
+
 
 def read_rgb(p):
     # Read an image as RGB
@@ -147,6 +152,30 @@ def draw_keypoint_map(
 
     cv2.imwrite(output_path, cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR))
 
+def draw_keypoint_map_labeled(
+    img_rgb: np.ndarray,
+    kp_pixels: np.ndarray | torch.Tensor,
+    output_path: str,
+) -> None:
+    dir_name = os.path.dirname(output_path)
+    if dir_name:
+        os.makedirs(dir_name, exist_ok=True)
+
+    canvas = img_rgb.copy()
+    if canvas.dtype != np.uint8:
+        canvas = np.clip(canvas, 0, 255).astype(np.uint8)
+    canvas_bgr = cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR)
+    pts = kp_pixels.detach().cpu().numpy() if isinstance(kp_pixels, torch.Tensor) else np.asarray(kp_pixels, dtype=np.float32)
+    pts = np.round(pts).astype(np.int32)
+    pts[:, 0] = np.clip(pts[:, 0], 0, canvas.shape[1] - 1)
+    pts[:, 1] = np.clip(pts[:, 1], 0, canvas.shape[0] - 1)
+
+    for i, (u, v) in enumerate(pts):
+        cv2.circle(canvas_bgr, (int(u), int(v)), 3, (40, 220, 255), -1, lineType=cv2.LINE_AA)
+        cv2.putText(canvas_bgr, str(i), (int(u) + 4, int(v) - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
+
+    cv2.imwrite(output_path, canvas_bgr)
+
 def project_keypoints_to_image(
     wrapper: LivePortraitWrapper,
     kp_info: Dict[str, torch.Tensor],
@@ -250,6 +279,125 @@ def draw_mouth_vectors(
         cv2.arrowedLine(canvas_bgr, start, end, (0, 140, 255), 2, tipLength=0.25)
 
     cv2.imwrite(path, canvas_bgr)
+
+
+def _two_nearest_x_midpoint(pts: np.ndarray, center_x: float) -> Optional[np.ndarray]:
+    if pts.shape[0] == 0:
+        return None
+    order = np.argsort(np.abs(pts[:, 0] - center_x))
+    chosen = pts[order[:2]]
+    if chosen.shape[0] == 1:
+        return chosen[0]
+    return chosen.mean(axis=0)
+
+
+def compute_lip_metrics(
+    kp_pixels: np.ndarray,
+    lip_idx,
+    img_shape: tuple[int, int],
+    verbose: bool = False,
+    corner_idx=None,
+) -> Optional[Dict[str, np.ndarray]]:
+    if kp_pixels is None or lip_idx is None:
+        return None
+    try:
+        pts_all = kp_pixels[np.array(lip_idx, dtype=int)]
+    except Exception:
+        return None
+    if pts_all.shape[0] < 2:
+        if verbose:
+            print(f"[lip-metrics/debug] insufficient lip pts: {pts_all.shape[0]}")
+        return None
+
+    mouth_center = pts_all.mean(axis=0)
+
+    upper_pts = pts_all[pts_all[:, 1] < mouth_center[1]]
+    lower_pts = pts_all[pts_all[:, 1] >= mouth_center[1]]
+    if upper_pts.shape[0] == 0 or lower_pts.shape[0] == 0:
+        sorted_y = pts_all[np.argsort(pts_all[:, 1])]
+        upper_pts = sorted_y[:2] if sorted_y.shape[0] >= 2 else sorted_y
+        lower_pts = sorted_y[-2:] if sorted_y.shape[0] >= 2 else sorted_y
+
+    upper_mid = _two_nearest_x_midpoint(upper_pts, mouth_center[0])
+    lower_mid = _two_nearest_x_midpoint(lower_pts, mouth_center[0])
+    if upper_mid is None or lower_mid is None:
+        return None
+
+    left_corner = None
+    right_corner = None
+    if corner_idx is not None and len(corner_idx) == 2:
+        try:
+            c_pts = kp_pixels[np.array(corner_idx, dtype=int)]
+            if c_pts.shape[0] == 2:
+                if c_pts[0, 0] <= c_pts[1, 0]:
+                    left_corner, right_corner = c_pts[0], c_pts[1]
+                else:
+                    left_corner, right_corner = c_pts[1], c_pts[0]
+        except Exception:
+            left_corner, right_corner = None, None
+    if left_corner is None or right_corner is None:
+        left_corner = pts_all[np.argmin(pts_all[:, 0])]
+        right_corner = pts_all[np.argmax(pts_all[:, 0])]
+
+    lip_gap = float(abs(upper_mid[1] - lower_mid[1]))
+    lip_width = float(np.linalg.norm(right_corner - left_corner))
+
+    return {
+        "lip_gap": lip_gap,
+        "lip_width": lip_width,
+        "upper_mid": upper_mid,
+        "lower_mid": lower_mid,
+        "left_corner": left_corner,
+        "right_corner": right_corner,
+    }
+
+
+def draw_lip_metrics_overlay(img_rgb: np.ndarray, lip_info: Dict[str, np.ndarray], out_path: str) -> None:
+    if lip_info is None or img_rgb is None or img_rgb.size == 0:
+        return
+    os.makedirs(osp.dirname(out_path), exist_ok=True)
+    canvas = img_rgb.copy()
+    if canvas.dtype != np.uint8:
+        canvas = np.clip(canvas, 0, 255).astype(np.uint8)
+    canvas_bgr = cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR)
+
+    def _pt(p):
+        return (int(round(p[0])), int(round(p[1])))
+
+    upper_mid = _pt(lip_info["upper_mid"])
+    lower_mid = _pt(lip_info["lower_mid"])
+    left_corner = _pt(lip_info["left_corner"])
+    right_corner = _pt(lip_info["right_corner"])
+
+    cv2.circle(canvas_bgr, upper_mid, 4, (0, 255, 255), -1, lineType=cv2.LINE_AA)  # yellow
+    cv2.circle(canvas_bgr, lower_mid, 4, (0, 255, 200), -1, lineType=cv2.LINE_AA)  # cyan-ish
+    cv2.circle(canvas_bgr, left_corner, 4, (255, 180, 0), -1, lineType=cv2.LINE_AA)
+    cv2.circle(canvas_bgr, right_corner, 4, (255, 100, 0), -1, lineType=cv2.LINE_AA)
+    cv2.line(canvas_bgr, upper_mid, lower_mid, (0, 220, 0), 2, lineType=cv2.LINE_AA)
+    cv2.line(canvas_bgr, left_corner, right_corner, (0, 0, 255), 2, lineType=cv2.LINE_AA)
+
+    cv2.putText(
+        canvas_bgr,
+        f"gap: {lip_info['lip_gap']:.2f}",
+        (10, 20),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (0, 255, 0),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        canvas_bgr,
+        f"width: {lip_info['lip_width']:.2f}",
+        (10, 44),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (0, 128, 255),
+        2,
+        cv2.LINE_AA,
+    )
+
+    cv2.imwrite(out_path, canvas_bgr)
 def _pct(a: torch.Tensor, q: float):
     return torch.quantile(a, torch.tensor(q, device=a.device))
 
@@ -310,9 +458,16 @@ def compute_masks(kp_can_t: torch.Tensor):
     yn = dyn / sy
     eyes_mask = (yn < -0.15) & (xn.abs() > 0.35)
     brows_mask = (yn < -0.30) & (xn.abs() > 0.25)
-    lips_mask = (yn > -0.35) & (xn.abs() < 0.95)
-    corner_mask = (yn > -0.20) & (xn.abs() >= 0.30) & (xn.abs() < 0.95)
-    center_lip_mask = (xn.abs() < 0.18) & (yn > -0.05) & (yn < 0.45)
+    lips_mask = torch.zeros_like(xn, dtype=torch.bool)
+    corner_mask = torch.zeros_like(xn, dtype=torch.bool)
+    center_lip_mask = torch.zeros_like(xn, dtype=torch.bool)
+    for idx in LIP_IDX:
+        if 0 <= idx < lips_mask.shape[0]:
+            lips_mask[idx] = True
+            center_lip_mask[idx] = True
+    for idx in LIP_CORNER_IDX:
+        if 0 <= idx < corner_mask.shape[0]:
+            corner_mask[idx] = True
     return {
         "eyes_mask": eyes_mask,
         "brows_mask": brows_mask,
@@ -381,6 +536,7 @@ def main(
     y_anchor=0.5,
     # control how much of the nonmouth bias we subtract from mouth Y (0=keep mouth free)
     y_drift_mouth_bias: float = 0.0,
+    lip_metrics: bool = False,
 ):
     # load models
     cfg = InferenceConfig(models_config=cfg_path)
@@ -408,6 +564,11 @@ def main(
         T_kp,
         "outputs/diagnostics/target_keypoint_map.jpg",
         kp_pixels=target_kp_pixels,
+    )
+    draw_keypoint_map_labeled(
+        target_rgb,
+        target_kp_pixels,
+        "outputs/diagnostics/target_keypoint_map_labeled.jpg",
     )
 
     flip_used = False
@@ -481,27 +642,16 @@ def main(
         # Normalized coords (zero-mean, unit-ish std)
         xn = dxn / sx
         yn = dyn / sy
-        # Horizontal band for mouth region
-        y_lo = torch.quantile(yn, torch.tensor(0.45, device=yn.device))
-        y_hi = torch.quantile(yn, torch.tensor(0.95, device=yn.device))
-
-        # mid and wide horizontal bands for lips vs corners
-        x_mid  = torch.quantile(xn.abs(), torch.tensor(0.60, device=xn.device))
-        x_wide = torch.quantile(xn.abs(), torch.tensor(0.90, device=xn.device))
-
-        lips_mask       = (yn >= y_lo) & (yn <= y_hi) & (xn.abs() <= x_mid)
-        corner_mask     = (yn >= y_lo) & (yn <= y_hi) & (xn.abs() >  x_mid) & (xn.abs() <= x_wide)
-        center_lip_mask = (yn >= y_lo) & (yn <= y_hi) & (xn.abs() <= (0.6 * x_mid))
-
-        if int(lips_mask.sum()) < 6:
-            # widen vertically and horizontally until we get a reasonable set
-            y_lo_f = torch.quantile(yn, torch.tensor(0.40, device=yn.device))
-            y_hi_f = torch.quantile(yn, torch.tensor(0.98, device=yn.device))
-            x_mid_f  = torch.quantile(xn.abs(), torch.tensor(0.75, device=xn.device))
-            x_wide_f = torch.quantile(xn.abs(), torch.tensor(0.97, device=xn.device))
-            lips_mask = (yn >= y_lo_f) & (yn <= y_hi_f) & (xn.abs() <= x_mid_f)
-            corner_mask = (yn >= y_lo_f) & (yn <= y_hi_f) & (xn.abs() > x_mid_f) & (xn.abs() <= x_wide_f)
-            center_lip_mask = (yn >= y_lo_f) & (yn <= y_hi_f) & (xn.abs() <= (0.6 * x_mid_f))
+        lips_mask = torch.zeros_like(xn, dtype=torch.bool)
+        corner_mask = torch.zeros_like(xn, dtype=torch.bool)
+        center_lip_mask = torch.zeros_like(xn, dtype=torch.bool)
+        for idx in LIP_IDX:
+            if 0 <= idx < lips_mask.shape[0]:
+                lips_mask[idx] = True
+                center_lip_mask[idx] = True
+        for idx in LIP_CORNER_IDX:
+            if 0 <= idx < corner_mask.shape[0]:
+                corner_mask[idx] = True
 
         # Eyes / brows (leave as-is; cap to not exceed 1x)
         eyes_mask = (yn < torch.quantile(yn, torch.tensor(0.25, device=yn.device))) & (xn.abs() > torch.quantile(xn.abs(), torch.tensor(0.55, device=xn.device)))
@@ -635,8 +785,14 @@ def main(
     yn = dy_t / sy_t
     xn_t = dx_t / sx_t
 
-    lips_mask2 = (yn > -0.35) & (xn_t.abs() < 0.95)
-    corner_mask2 = (yn > -0.20) & (xn_t.abs() >= 0.30) & (xn_t.abs() < 0.95)
+    lips_mask2 = torch.zeros_like(yn, dtype=torch.bool)
+    corner_mask2 = torch.zeros_like(yn, dtype=torch.bool)
+    for idx in LIP_IDX:
+        if 0 <= idx < lips_mask2.shape[0]:
+            lips_mask2[idx] = True
+    for idx in LIP_CORNER_IDX:
+        if 0 <= idx < corner_mask2.shape[0]:
+            corner_mask2[idx] = True
     stable = ~(lips_mask2 | corner_mask2)
 
     dy = exp_delta[0, :, 1]
@@ -762,6 +918,34 @@ def main(
         "outputs/diagnostics/result_keypoint_map.jpg",
     )
 
+    if lip_metrics:
+        lip_dir = osp.join("outputs", "lip_metrics")
+        os.makedirs(lip_dir, exist_ok=True)
+
+        donor_kp_pixels = project_keypoints_to_image(wrap, D_kp, donor_rgb)
+        donor_metrics = compute_lip_metrics(donor_kp_pixels, LIP_IDX, donor_rgb.shape, verbose=True, corner_idx=LIP_CORNER_IDX)
+
+        target_before_metrics = compute_lip_metrics(target_kp_pixels, LIP_IDX, target_rgb.shape, corner_idx=LIP_CORNER_IDX)
+        target_after_kp_pixels = project_keypoints_to_image(wrap, T_kp_mod, img_asym)
+        target_after_metrics = compute_lip_metrics(target_after_kp_pixels, LIP_IDX, img_asym.shape, corner_idx=LIP_CORNER_IDX)
+
+        def _fmt(name: str, info: Optional[Dict[str, np.ndarray]]) -> str:
+            if info is None:
+                return f"{name}: n/a"
+            return f"{name}: gap={info['lip_gap']:.2f}, width={info['lip_width']:.2f}"
+
+        print("[lip-metrics]")
+        print("  " + _fmt("donor", donor_metrics))
+        print("  " + _fmt("target_before", target_before_metrics))
+        print("  " + _fmt("target_after", target_after_metrics))
+
+        if donor_metrics is not None:
+            draw_lip_metrics_overlay(donor_rgb, donor_metrics, osp.join(lip_dir, "donor_lip_metrics.png"))
+        if target_before_metrics is not None:
+            draw_lip_metrics_overlay(target_rgb, target_before_metrics, osp.join(lip_dir, "target_before_lip_metrics.png"))
+        if target_after_metrics is not None:
+            draw_lip_metrics_overlay(img_asym, target_after_metrics, osp.join(lip_dir, "target_after_lip_metrics.png"))
+
     # save diagnostics
     os.makedirs("outputs/diagnostics", exist_ok=True)
     out_w_res, out_h_res = resolve_output_size(target_rgb, out_w, out_h)
@@ -840,6 +1024,8 @@ if __name__ == "__main__":
     ap.add_argument("--y_drift_fix", type=str, default="nonmouth", choices=["none", "global", "nonmouth"])
     ap.add_argument("--y_anchor", type=float, default=0.5)
     ap.add_argument("--y_drift_mouth_bias", type=float, default=0.0)
+    # Debug: quantify mouth opening (gap) and corner spread (width) for stroke-related asymmetry checks
+    ap.add_argument("--lip-metrics", action="store_true", help="Compute lip gap/width metrics and debug overlay.")
 
     a = ap.parse_args()
     main(
@@ -869,4 +1055,5 @@ if __name__ == "__main__":
         y_drift_fix=a.y_drift_fix,
         y_anchor=a.y_anchor,
         y_drift_mouth_bias=a.y_drift_mouth_bias,
+        lip_metrics=a.lip_metrics,
     )
