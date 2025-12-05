@@ -1,20 +1,19 @@
 import sys, os, os.path as osp, cv2, torch
 import numpy as np
 
-# make "src" importable when running from scripts/
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from src.config.inference_config import InferenceConfig
 from src.live_portrait_wrapper import LivePortraitWrapper
 
 def read_rgb(p):
-    # Read an image from disk as RGB
+    # Read an image as RGB
     img = cv2.imread(p, cv2.IMREAD_COLOR)
     if img is None:
         raise FileNotFoundError(p)
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 def save_rgb(p, img_rgb):
-    # Save an RGB image to disk, mkdir as needed
+    # Save an RGB image
     os.makedirs(osp.dirname(p), exist_ok=True)
     cv2.imwrite(p, cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR))
 
@@ -34,12 +33,6 @@ def letterbox_to(img_rgb: np.ndarray, out_w: int, out_h: int) -> np.ndarray:
     return canvas
 
 def resolve_output_size(target_rgb: np.ndarray, out_w: int, out_h: int):
-    """
-    Decide final output size
-    - If neither width nor height provided: use target image size
-    - If one side provided: compute the other to preserve target aspect
-    - If both provided: use them as is
-    """
     Ht, Wt = target_rgb.shape[:2]
     if out_w <= 0 and out_h <= 0:
         return Wt, Ht
@@ -50,10 +43,6 @@ def resolve_output_size(target_rgb: np.ndarray, out_w: int, out_h: int):
     return out_w, out_h
 
 def procrustes_scale(src_xy: torch.Tensor, dst_xy: torch.Tensor) -> float:
-    """
-    Compute the best-fit similarity *scale* that maps src->dst (least-squares)
-    Only keep the scalar (zoom). Adjusts for different zooms in X/Y
-    """
     src = src_xy - src_xy.mean(dim=0, keepdim=True)
     dst = dst_xy - dst_xy.mean(dim=0, keepdim=True)
     src_norm = torch.linalg.norm(src)
@@ -63,20 +52,20 @@ def procrustes_scale(src_xy: torch.Tensor, dst_xy: torch.Tensor) -> float:
     return float((dst_norm / (src_norm + 1e-8)).item())
 
 def similarity_decompose(src_xy: torch.Tensor, dst_xy: torch.Tensor):
-    # Compute best-fit 2x2 rotation matrix. Adjusts for rotation in X/Y
+    # Compute best-fit 2x2 rotation matrix and adjust rotation
     src = src_xy - src_xy.mean(dim=0, keepdim=True)
     dst = dst_xy - dst_xy.mean(dim=0, keepdim=True)
     H = src.T @ dst
     U, S, Vt = torch.linalg.svd(H)
     R = U @ Vt
-    if torch.det(R) < 0:             # handle reflections to keep a proper rotation
+    if torch.det(R) < 0:
         Vt[-1, :] *= -1
         R = U @ Vt
     theta = float(torch.atan2(R[1, 0], R[0, 0]).item())
     return R, theta
 
 def affine_detrend_dx(dx: torch.Tensor, kp_xy: torch.Tensor):
-    # Remove global widening from X motion by fitting: dx ≈ a*(x-xc) + b*(y-yc) + c and subtracting it off
+    # Remove global widening from X motion by fitting: dx ~ a*(x-xc) + b*(y-yc) + c and subtracting it off
     x = kp_xy[:, 0]; y = kp_xy[:, 1]
     xc = x.mean(); yc = y.mean()
     X = torch.stack([x - xc, y - yc, torch.ones_like(x)], dim=1)  # (N,3)
@@ -86,10 +75,10 @@ def affine_detrend_dx(dx: torch.Tensor, kp_xy: torch.Tensor):
 
 def soft_knee_vec(V: torch.Tensor, tau: float) -> torch.Tensor:
     # Compress vector magnitudes to avoid extreme values
-    # m' = tau * tanh(m / tau)  -> behaves linear for small m, saturates for big m
-    m = torch.linalg.norm(V, dim=-1, keepdim=True) + 1e-8 # per keypoint motion magnitude
+    # m' = tau * tanh(m / tau)
+    m = torch.linalg.norm(V, dim=-1, keepdim=True) + 1e-8
     m_prime = float(tau) * torch.tanh(m / float(tau))
-    gain = (m_prime / m).clamp(max=1.0)  # dont amplify
+    gain = (m_prime / m).clamp(max=1.0)
     return V * gain
 
 def soft_knee_scalar(d: torch.Tensor, tau: float) -> torch.Tensor:
@@ -100,23 +89,17 @@ def soft_knee_scalar(d: torch.Tensor, tau: float) -> torch.Tensor:
 
 
 def kp_to_pixels(kp_xy: torch.Tensor, height: int, width: int) -> np.ndarray:
-    """
-    Convert normalized [-1, 1] keypoints (or already-pixel coords) into pixel space.
-    """
     if isinstance(kp_xy, torch.Tensor):
         xy = kp_xy.detach().float().cpu().numpy()
     else:
         xy = np.asarray(kp_xy, dtype=np.float32)
-
     x = xy[:, 0]
     y = xy[:, 1]
-
     if np.all(np.isfinite(xy)) and np.median(np.abs(xy)) <= 1.2:
         px = (x + 1.0) * 0.5 * (width - 1)
         py = (y + 1.0) * 0.5 * (height - 1)
     else:
         px, py = x, y
-
     pts = np.stack([px, py], axis=1)
     pts[:, 0] = np.clip(pts[:, 0], 0, width - 1)
     pts[:, 1] = np.clip(pts[:, 1], 0, height - 1)
@@ -129,9 +112,6 @@ def draw_keypoint_overlay(
     model_shape: tuple[int, int],
     output_path: str,
 ) -> None:
-    """
-    Draw projected keypoints on the original image so diagnostics align with the face.
-    """
     dir_name = os.path.dirname(output_path)
     if dir_name:
         os.makedirs(dir_name, exist_ok=True)
@@ -227,11 +207,6 @@ def main(
     R = R.to(dtype=exp_delta.dtype, device=exp_delta.device)
     exp_delta[0, :, 0:2] = exp_delta[0, :, 0:2] @ R
 
-    """
-    Keep motion concentrated around the middle of the face
-    Cheeks tend to “swell/widen” if outer landmarks move laterally
-    This weights X-motion down toward the edges
-    """
     with torch.no_grad():
         xy = kp_can_t[:, :2]
         cx, cy = xy.mean(dim=0)
@@ -242,9 +217,8 @@ def main(
         sig_y = 0.90
         w_roi = torch.exp(-0.5*((dxn/(sig_x*sx))**2 + (dyn/(sig_y*sy))**2))  # (N,)
         w_roi = 0.25 + 0.75*w_roi
-        exp_delta[0,:,0] *= w_roi  # only X (sideways)
+        exp_delta[0,:,0] *= w_roi
 
-    # fully zero X on the outer ~12% of face width (hard guardrail)
     span_x = (kp_can_t[:,0] - kp_can_t[:,0].mean()).abs().max() + 1e-6
     edge_thresh = 0.88
     edge_mask = ((kp_can_t[:,0] - kp_can_t[:,0].mean()).abs() / span_x) > edge_thresh
@@ -332,7 +306,7 @@ def main(
     out_asym = wrap.warp_decode(feat_3d, kp_source,  kp_driving)
     img_asym = wrap.parse_output(out_asym["out"])[0]
 
-    # save diagnostics
+    # diagnostics
     diag_dir = "outputs/diagnostics"
     os.makedirs(diag_dir, exist_ok=True)
     model_shape = wrap.inference_cfg.input_shape
@@ -351,7 +325,6 @@ def main(
 
     side_dr = np.hstack([donor_lb, img_asym_lb])                   # donor vs result
     cv2.imwrite(osp.join(diag_dir, "donor_vs_result.jpg"), cv2.cvtColor(side_dr, cv2.COLOR_RGB2BGR))
-
     # final output
     save_rgb(out_path, img_asym_lb)
     print("[OK]", out_path)
