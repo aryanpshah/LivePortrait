@@ -328,16 +328,25 @@ def _infer_mouth_kp_roles(
 ) -> Dict[str, int]:
     """
     Infer which LivePortrait keypoint indices correspond to mouth roles
-    using spatial heuristics.
+    using spatial heuristics with GUARANTEED uniqueness.
+
+    Algorithm (enforces uniqueness):
+    A) Compute x_center = mean(kp_px[mouth_kp_idx, 0])
+    B) corners = two indices with largest |x - x_center|. Assign by x position.
+    C) remaining = mouth_kp_idx minus corners
+    D) upper_center = remaining with smallest y
+    E) lower_center = remaining with largest y
+    F) center = remaining closest to mean of remaining (if not upper/lower)
 
     Returns dict with keys:
       - left_corner, right_corner, upper_center, lower_center, center
     Each maps to an LP keypoint index (0-20).
+    ALL FIVE ARE GUARANTEED DISTINCT.
     """
     mouth_kp_idx = np.where(lips_mask)[0]
 
     if len(mouth_kp_idx) < 5:
-        # Fallback: return empty/dummy dict
+        # Fallback: return dummy dict
         return {
             "left_corner": -1,
             "right_corner": -1,
@@ -346,52 +355,62 @@ def _infer_mouth_kp_roles(
             "center": -1,
         }
 
+    # Step A: Compute x-center of mouth region
     mouth_kp_px = kp_px[mouth_kp_idx]
-    cx = mouth_kp_px[:, 0].mean()
-    cy = mouth_kp_px[:, 1].mean()
+    x_center = mouth_kp_px[:, 0].mean()
+    y_center = mouth_kp_px[:, 1].mean()
 
-    # Distance from center
-    dx = mouth_kp_px[:, 0] - cx
-    dy = mouth_kp_px[:, 1] - cy
-    dist = np.sqrt(dx**2 + dy**2)
-
-    # Corners: largest |x| displacement
-    corner_mask = np.abs(dx) > np.percentile(np.abs(dx), 70)
-    if corner_mask.sum() >= 2:
-        corner_candidates = mouth_kp_idx[corner_mask]
-        left_corner = corner_candidates[kp_px[corner_candidates, 0].argmin()]
-        right_corner = corner_candidates[kp_px[corner_candidates, 0].argmax()]
+    # Step B: Find two corners with largest |x - x_center|
+    dx = np.abs(mouth_kp_px[:, 0] - x_center)
+    corner_indices_local = np.argsort(dx)[-2:]  # Last 2 (largest)
+    corner_indices = mouth_kp_idx[corner_indices_local]
+    
+    # Assign by x position: left has smaller x
+    if kp_px[corner_indices[0], 0] < kp_px[corner_indices[1], 0]:
+        left_corner = corner_indices[0]
+        right_corner = corner_indices[1]
     else:
-        # Fallback: leftmost and rightmost
-        left_corner = mouth_kp_idx[kp_px[mouth_kp_idx, 0].argmin()]
-        right_corner = mouth_kp_idx[kp_px[mouth_kp_idx, 0].argmax()]
+        left_corner = corner_indices[1]
+        right_corner = corner_indices[0]
 
-    # Remove corners from remaining
+    # Step C: Remove corners from remaining pool
     remaining = np.array([idx for idx in mouth_kp_idx if idx not in [left_corner, right_corner]])
-
-    if len(remaining) >= 3:
-        # Upper vs lower
-        upper_mask = kp_px[remaining, 1] < cy
-        if upper_mask.sum() >= 1:
-            upper_candidates = remaining[upper_mask]
-            upper_center = upper_candidates[np.abs(kp_px[upper_candidates, 0] - cx).argmin()]
-        else:
-            upper_center = remaining[0]
-
-        lower_candidates = remaining[kp_px[remaining, 1] >= cy]
-        if len(lower_candidates) >= 1:
-            lower_center = lower_candidates[np.abs(kp_px[lower_candidates, 0] - cx).argmin()]
-        else:
-            lower_center = remaining[-1]
-
-        # Center: closest to mean in remaining
-        remaining_dist = np.sqrt((kp_px[remaining, 0] - cx)**2 + (kp_px[remaining, 1] - cy)**2)
-        center = remaining[remaining_dist.argmin()]
+    
+    if len(remaining) < 3:
+        # Not enough points for full assignment, use simple fallback
+        remaining_sorted_y = remaining[np.argsort(kp_px[remaining, 1])]
+        upper_center = remaining_sorted_y[0]
+        lower_center = remaining_sorted_y[-1]
+        # Center is middle
+        center = remaining[len(remaining) // 2]
     else:
-        # Fallback
-        upper_center = mouth_kp_idx[kp_px[mouth_kp_idx, 1].argmin()]
-        lower_center = mouth_kp_idx[kp_px[mouth_kp_idx, 1].argmax()]
-        center = mouth_kp_idx[dist.argmin()]
+        # Step D: upper_center = remaining with smallest y
+        y_vals = kp_px[remaining, 1]
+        upper_center = remaining[np.argmin(y_vals)]
+        
+        # Step E: lower_center = remaining with largest y
+        lower_center = remaining[np.argmax(y_vals)]
+        
+        # Step F: center = closest to mean(remaining), but NOT upper/lower
+        mean_remaining_px = kp_px[remaining, :].mean(axis=0)
+        distances = np.sqrt((kp_px[remaining, 0] - mean_remaining_px[0])**2 + 
+                           (kp_px[remaining, 1] - mean_remaining_px[1])**2)
+        
+        # Find the remaining point closest to mean that is NOT upper or lower
+        sorted_by_dist = remaining[np.argsort(distances)]
+        center = None
+        for candidate in sorted_by_dist:
+            if candidate != upper_center and candidate != lower_center:
+                center = candidate
+                break
+        
+        # If all candidates are upper/lower (shouldn't happen), pick any
+        if center is None:
+            center = remaining[(len(remaining) - 1) // 2]
+    
+    # Step G: Assert all 5 are distinct
+    roles = [left_corner, right_corner, upper_center, lower_center, center]
+    assert len(set(roles)) == 5, f"Mouth roles not unique: {roles}"
 
     return {
         "left_corner": int(left_corner),
@@ -587,6 +606,131 @@ def project_delta_to_exp_basis(
             import traceback
             traceback.print_exc()
         return None, stats
+
+
+def compute_one_sided_weights(
+    side_mode: str,
+    lips_fm_idx: List[int],
+    Lt_px: np.ndarray,
+    delta_target_px: np.ndarray,
+    sigma: float = 18.0,
+    center_weight: float = 0.6,
+    verbose: bool = False,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """
+    Compute per-FaceMesh-lip weight for one-sided gating.
+
+    Args:
+        side_mode: 'bilateral', 'auto', 'right', or 'left'.
+        lips_fm_idx: FaceMesh indices for all lip landmarks.
+        Lt_px: FaceMesh landmarks on target frame (468, 2).
+        delta_target_px: Aligned delta (468, 2).
+        sigma: Softness parameter for sigmoid fade (in pixels).
+        center_weight: How much center region (upper/lower midline) gets even in one-sided mode.
+        verbose: Print debug info.
+
+    Returns:
+        Tuple of:
+            - weights: (len(lips_fm_idx),) weights in [0, 1]
+            - stats: dict with side_mode, sigma, center_weight, mean_w, max_w, selected_side (if auto)
+    """
+    stats = {
+        "side_mode": side_mode,
+        "sigma": sigma,
+        "center_weight": center_weight,
+        "mean_weight": 0.0,
+        "max_weight": 0.0,
+        "selected_side": None,
+    }
+    
+    # Default: bilateral (all ones)
+    if side_mode == "bilateral":
+        weights = np.ones(len(lips_fm_idx), dtype=np.float32)
+        stats["mean_weight"] = 1.0
+        stats["max_weight"] = 1.0
+        return weights, stats
+    
+    # Determine mouth midline in target frame
+    lips_fm_idx_set = set(lips_fm_idx)
+    mouth_x_vals = []
+    for idx in lips_fm_idx:
+        if idx < Lt_px.shape[0]:
+            mouth_x_vals.append(Lt_px[idx, 0])
+    
+    if not mouth_x_vals:
+        # Fallback
+        weights = np.ones(len(lips_fm_idx), dtype=np.float32)
+        return weights, stats
+    
+    mouth_mid_x = np.mean(mouth_x_vals)
+    
+    # For 'auto' mode: determine side by corner motion
+    selected_side = None
+    if side_mode == "auto":
+        FACEMESH_LIP_CORNERS_IDX = [61, 291]  # left, right
+        dy_left = 0.0
+        dy_right = 0.0
+        
+        for i, idx in enumerate(lips_fm_idx):
+            if idx == FACEMESH_LIP_CORNERS_IDX[0]:  # left corner
+                dy_left = delta_target_px[i, 1]
+            elif idx == FACEMESH_LIP_CORNERS_IDX[1]:  # right corner
+                dy_right = delta_target_px[i, 1]
+        
+        # Choose side with more downward motion (more negative dy, assuming y down is positive)
+        # Use absolute magnitude to decide
+        if abs(dy_left) > abs(dy_right):
+            selected_side = "left"
+        else:
+            selected_side = "right"
+        
+        stats["selected_side"] = selected_side
+        mode_to_use = selected_side
+    else:
+        mode_to_use = side_mode
+    
+    # Compute sigmoid weights based on x position
+    weights = np.ones(len(lips_fm_idx), dtype=np.float32)
+    
+    # Sigmoid function: sigmoid(z) = 1 / (1 + exp(-z))
+    def sigmoid(z):
+        return 1.0 / (1.0 + np.exp(-np.clip(z, -500, 500)))
+    
+    for i, idx in enumerate(lips_fm_idx):
+        if idx < Lt_px.shape[0]:
+            x_i = Lt_px[idx, 0]
+            
+            if mode_to_use == "right":
+                # Right side: w_i = sigmoid((x_i - mouth_mid_x) / sigma)
+                z = (x_i - mouth_mid_x) / sigma
+                w = sigmoid(z)
+            elif mode_to_use == "left":
+                # Left side: w_i = sigmoid((mouth_mid_x - x_i) / sigma)
+                z = (mouth_mid_x - x_i) / sigma
+                w = sigmoid(z)
+            else:
+                w = 1.0
+            
+            # Boost center region even in one-sided mode
+            if mode_to_use in ["left", "right"]:
+                # Check if this is a center region landmark
+                FACEMESH_LIP_MID_TOP_IDX = [0, 13]
+                FACEMESH_LIP_MID_BOT_IDX = [17, 14]
+                if idx in FACEMESH_LIP_MID_TOP_IDX or idx in FACEMESH_LIP_MID_BOT_IDX:
+                    w = max(w, center_weight)
+            
+            weights[i] = float(w)
+    
+    stats["mean_weight"] = float(weights.mean())
+    stats["max_weight"] = float(weights.max())
+    
+    if verbose:
+        print(f"[facemesh_exp_assist] One-sided weights (mode={mode_to_use}):")
+        print(f"  mean_weight={stats['mean_weight']:.3f}, max_weight={stats['max_weight']:.3f}")
+        if selected_side:
+            print(f"  auto-selected side: {selected_side}")
+    
+    return weights, stats
 
 
 def project_delta_to_exp_knn(
@@ -1064,6 +1208,9 @@ def apply_facemesh_exp_assist(
     lips_mask_indices: Optional[List[int]] = None,
     corner_mask_indices: Optional[List[int]] = None,
     verbose: bool = False,
+    side_mode: str = "bilateral",
+    side_sigma: float = 18.0,
+    center_weight: float = 0.6,
 ) -> Tuple[Optional[Any], Dict[str, Any]]:
     """
     Orchestrator: compute FaceMesh-based exp delta correction with guardrails.
@@ -1207,6 +1354,27 @@ def apply_facemesh_exp_assist(
         Lt_px = align_result["Lt_px"]
         delta_target_px = align_result["delta_target_px"]
         debug_dict["transform"] = align_result["transform"]
+
+        # Step 2b: Compute one-sided weights if needed
+        one_sided_weights = None
+        if side_mode != "bilateral":
+            one_sided_weights, weight_stats = compute_one_sided_weights(
+                side_mode=side_mode,
+                lips_fm_idx=FACEMESH_MOUTH_ALL_IDX,
+                Lt_px=Lt_px,
+                delta_target_px=delta_target_px,
+                sigma=side_sigma,
+                center_weight=center_weight,
+                verbose=verbose,
+            )
+            debug_dict["side_weights"] = weight_stats
+            
+            # Apply weights to FaceMesh deltas BEFORE projection
+            for i in range(len(FACEMESH_MOUTH_ALL_IDX)):
+                if i < delta_target_px.shape[0]:
+                    delta_target_px[i] *= one_sided_weights[i]
+        else:
+            debug_dict["side_weights"] = {"side_mode": "bilateral"}
 
         # Step 3: Project lip deltas to LP keypoints
         if method == "basis":

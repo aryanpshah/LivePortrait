@@ -579,6 +579,10 @@ def main(
     facemesh_exp_smooth: bool = True,
     facemesh_exp_smooth_k: int = 6,
     facemesh_exp_zero_stable: bool = True,
+    # FaceMesh Expression Assist - One-sided gating
+    facemesh_exp_side: str = "bilateral",
+    facemesh_exp_side_sigma: float = 18.0,
+    facemesh_exp_center_weight: float = 0.6,
     # FaceMesh warp parameters (Phase 3-5)
     facemesh_warp: bool = False,
     facemesh_warp_method: str = "tps",
@@ -877,6 +881,9 @@ def main(
                 lips_mask_indices=LIP_IDX,
                 corner_mask_indices=LIP_CORNER_IDX,
                 verbose=True,
+                side_mode=facemesh_exp_side,
+                side_sigma=facemesh_exp_side_sigma,
+                center_weight=facemesh_exp_center_weight,
             )
 
             if exp_delta_fm is not None:
@@ -1113,6 +1120,9 @@ def main(
                 lips_mask_indices=LIP_IDX,
                 corner_mask_indices=LIP_CORNER_IDX,
                 verbose=True,
+                side_mode=facemesh_exp_side,
+                side_sigma=facemesh_exp_side_sigma,
+                center_weight=facemesh_exp_center_weight,
             )
 
             if exp_delta_fm is not None and fm_debug_dict.get("ok", False):
@@ -1266,6 +1276,9 @@ def main(
                 lips_mask_indices=LIP_IDX,
                 corner_mask_indices=LIP_CORNER_IDX,
                 verbose=True,
+                side_mode=facemesh_exp_side,
+                side_sigma=facemesh_exp_side_sigma,
+                center_weight=facemesh_exp_center_weight,
             )
 
             if exp_delta_fm is not None and fm_debug_dict.get("ok", False):
@@ -1637,6 +1650,15 @@ if __name__ == "__main__":
                     help="K for smoothing neighbors (default 6).")
     ap.add_argument("--facemesh-exp-zero-stable", action="store_true", default=True,
                     help="Zero out non-mouth keypoints (default: True, prevents 'cursed' outputs).")
+    
+    # FaceMesh Expression Assist - One-sided gating (Phase 4)
+    ap.add_argument("--facemesh-exp-side", type=str, default="bilateral",
+                    choices=["bilateral", "auto", "right", "left"],
+                    help="One-sided gating: 'bilateral' (default, both sides), 'auto' (detect droop side), 'right', 'left'.")
+    ap.add_argument("--facemesh-exp-side-sigma", type=float, default=18.0,
+                    help="Softness parameter for sigmoid fade between mouth sides (in pixels, default 18.0).")
+    ap.add_argument("--facemesh-exp-center-weight", type=float, default=0.6,
+                    help="How much center region (upper/lower midline) receives correction even in one-sided mode (0-1, default 0.6).")
 
     # FaceMesh-based post-process warp (Phase 3-5)
     ap.add_argument("--facemesh-warp", action="store_true",
@@ -1784,6 +1806,9 @@ if __name__ == "__main__":
         facemesh_exp_smooth=a.facemesh_exp_smooth,
         facemesh_exp_smooth_k=a.facemesh_exp_smooth_k,
         facemesh_exp_zero_stable=a.facemesh_exp_zero_stable,
+        facemesh_exp_side=a.facemesh_exp_side,
+        facemesh_exp_side_sigma=a.facemesh_exp_side_sigma,
+        facemesh_exp_center_weight=a.facemesh_exp_center_weight,
         facemesh_warp=a.facemesh_warp,
         facemesh_warp_method=a.facemesh_warp_method,
         facemesh_warp_alpha=a.facemesh_warp_alpha,
