@@ -846,7 +846,7 @@ def main(
                 mag_max_before = 0.0
 
             # Get LP keypoints in pixel space for projection
-            target_kp_pixels_for_fm = kp_to_pixels(kp_can_t[:, :2], target_rgb.shape[0], target_rgb.shape[1])
+            target_kp_pixels_for_fm = project_keypoints_to_image(wrap, T_kp, target_rgb)
 
             # Get or create extractor
             if facemesh_driving and 'extractor' in locals():
@@ -862,16 +862,21 @@ def main(
 
             # Apply FaceMesh expression assist
             exp_delta_fm, fm_debug_dict = apply_facemesh_exp_assist(
+                donor_rgb=donor_rgb,
                 target_rgb=target_rgb,
-                target_kp_px=target_kp_pixels_for_fm,
+                exp_delta=exp_delta,
                 extractor=fm_extractor,
-                beta=beta,
+                lp_keypoints_px=target_kp_pixels_for_fm,
+                beta=facemesh_exp_beta,
+                mouth_alpha=facemesh_exp_mouth_alpha,
                 method=facemesh_exp_method,
                 knn_k=facemesh_exp_knn_k,
-                smooth=facemesh_exp_smooth,
-                max_disp_px=facemesh_exp_max_disp_px,
+                tps_reg=1e-3,
+                inject_stage=facemesh_exp_inject_stage,
                 debug=facemesh_exp_debug,
-                verbose=verbose,
+                lips_mask_indices=LIP_IDX,
+                corner_mask_indices=LIP_CORNER_IDX,
+                verbose=True,
             )
 
             if exp_delta_fm is not None:
@@ -901,7 +906,7 @@ def main(
                         print(f"[FaceMesh-EXP] Warning: Failed to save debug artifacts: {e}")
         except Exception as e:
             print(f"[FaceMesh-EXP] Error in pre_gain injection: {e}")
-            if verbose:
+            if facemesh_exp_debug:
                 import traceback
                 traceback.print_exc()
 

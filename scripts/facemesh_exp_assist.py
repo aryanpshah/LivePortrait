@@ -384,8 +384,9 @@ def _infer_mouth_kp_roles(
         else:
             lower_center = remaining[-1]
 
-        # Center: closest to mean
-        center = remaining[dist[remaining - mouth_kp_idx[0]].argmin()] if len(remaining) > 0 else mouth_kp_idx[0]
+        # Center: closest to mean in remaining
+        remaining_dist = np.sqrt((kp_px[remaining, 0] - cx)**2 + (kp_px[remaining, 1] - cy)**2)
+        center = remaining[remaining_dist.argmin()]
     else:
         # Fallback
         upper_center = mouth_kp_idx[kp_px[mouth_kp_idx, 1].argmin()]
