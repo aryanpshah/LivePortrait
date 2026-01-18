@@ -6,6 +6,7 @@
 
 # Base dependencies (expanded from requirements_base.txt)
 numpy==1.26.4
+mediapipe==0.10.9
 pyyaml==6.0.1
 opencv-python==4.10.0.84
 scipy==1.13.1
@@ -16,17 +17,20 @@ rich==13.7.1
 ffmpeg-python==0.2.0
 onnx==1.16.1
 scikit-image==0.24.0
-albumentations==1.4.10
+albumentations==1.4.2
 matplotlib==3.9.0
 imageio-ffmpeg==0.5.1
 tyro==0.8.5
 gradio==5.1.0
 pykalman==0.9.7
 pillow>=10.2.0
+requests==2.32.3
 
 # Extras used by the project
 # onnxruntime-gpu==1.18.0
 transformers==4.38.0
+torch==2.3.1
+torchvision==0.18.1
 
 # Optional: if you prefer CPU-only ONNX runtime, comment the GPU line above and
 # uncomment the following:

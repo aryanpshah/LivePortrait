@@ -1,10 +1,30 @@
-import sys, os, os.path as osp, cv2, torch, math
+import sys, os, os.path as osp, cv2, torch, math, json
 import numpy as np
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from src.config.inference_config import InferenceConfig
 from src.live_portrait_wrapper import LivePortraitWrapper
+from scripts.facemesh_landmarks import (
+    FaceMeshLandmarkExtractor,
+    compute_donor_asymmetry_delta,
+    load_facemesh_regions_config,
+    draw_facemesh_overlay,
+    draw_delta_heatmap,
+    draw_comparison_overlay,
+    draw_flipback_indexed_lines,
+    save_facemesh_numpy_dumps,
+    save_facemesh_summary,
+    FACEMESH_LIPS_IDX,
+    FACEMESH_FACE_OVAL_IDX,
+    FACEMESH_ANCHOR_IDX,
+)
+from scripts.facemesh_warp import (
+    apply_facemesh_warp,
+    validate_warp,
+)
+from scripts.facemesh_metrics import compute_metrics
+from scripts.facemesh_exp_assist import apply_facemesh_exp_assist
 
 # basic run command: python asym_transfer.py \--donor path/to/donor.jpg \--target path/to/target.jpg \--out outputs/asym_transfer.jpg
 
@@ -537,6 +557,67 @@ def main(
     # control how much of the nonmouth bias we subtract from mouth Y (0=keep mouth free)
     y_drift_mouth_bias: float = 0.0,
     lip_metrics: bool = False,
+    # FaceMesh parameters
+    facemesh_driving: bool = False,
+    facemesh_debug: bool = False,
+    facemesh_regions: Optional[str] = None,
+    facemesh_max_delta_px: Optional[float] = None,
+    facemesh_clamp_percentile: float = 98.0,
+    facemesh_save_npy: bool = False,
+    cheek_radius_px: Optional[float] = None,
+    facemesh_refine: bool = False,
+    # FaceMesh Expression Assist parameters
+    facemesh_exp_assist: bool = False,
+    facemesh_exp_beta: float = 1.0,
+    facemesh_exp_mouth_alpha: float = 1.0,
+    facemesh_exp_method: str = "knn",
+    facemesh_exp_knn_k: int = 8,
+    facemesh_exp_inject_stage: str = "post_drift",
+    facemesh_exp_debug: bool = False,
+    facemesh_exp_max_disp_px: Optional[float] = None,
+    facemesh_exp_cap_percentile: float = 98.0,
+    facemesh_exp_smooth: bool = True,
+    facemesh_exp_smooth_k: int = 6,
+    facemesh_exp_zero_stable: bool = True,
+    # FaceMesh warp parameters (Phase 3-5)
+    facemesh_warp: bool = False,
+    facemesh_warp_method: str = "tps",
+    facemesh_warp_alpha: float = 1.0,
+    facemesh_warp_reg: float = 1e-3,
+    facemesh_warp_grid_step: int = 2,
+    facemesh_warp_lock_boundary: bool = True,
+    facemesh_warp_validate: bool = True,
+    facemesh_warp_save_field: bool = False,
+    # Phase 6 guardrails
+    facemesh_guards: Optional[bool] = None,
+    facemesh_guard_debug: bool = False,
+    guard_max_delta_px: Optional[float] = None,
+    guard_cap_percentile: float = 98.0,
+    guard_cap_region: str = "weighted_only",
+    guard_cap_after_align: bool = True,
+    guard_smooth_delta: bool = True,
+    guard_smooth_iterations: int = 2,
+    guard_smooth_lambda: float = 0.6,
+    guard_smooth_mode: str = "knn",
+    guard_knn_k: int = 8,
+    guard_zero_anchor: bool = True,
+    guard_anchor_idx: Optional[List[int]] = None,
+    guard_anchor_strength: float = 0.95,
+    guard_softmask: bool = True,
+    guard_softmask_sigma: float = 25.0,
+    guard_softmask_forehead_fade: bool = True,
+    guard_softmask_forehead_yfrac: float = 0.22,
+    guard_softmask_min: float = 0.0,
+    guard_softmask_max: float = 1.0,
+    guard_face_mask: bool = True,
+    guard_face_mask_mode: str = "hull",
+    guard_face_mask_dilate: int = 12,
+    guard_face_mask_erode: int = 0,
+    guard_face_mask_blur: int = 11,
+    guard_warp_face_only: bool = True,
+    guard_mouth_only: bool = False,
+    guard_mouth_radius_px: int = 90,
+    guard_alpha_start: float = 0.3,
 ):
     # load models
     cfg = InferenceConfig(models_config=cfg_path)
@@ -545,6 +626,124 @@ def main(
     # read donor (has asymmetry) and target (neutral avatar)
     donor_rgb = read_rgb(donor_path)
     target_rgb = read_rgb(target_path)
+    
+    # =========================================================================
+    # FaceMesh-based donor asymmetry analysis (if enabled)
+    # =========================================================================
+    facemesh_result = None
+    if facemesh_driving:
+        print("\n[FaceMesh] Computing donor asymmetry driving signal...")
+        
+        # Initialize extractor
+        extractor = FaceMeshLandmarkExtractor(
+            static_image_mode=True,
+            max_num_faces=1,
+            verbose=True,
+            refine_landmarks=facemesh_refine,
+            debug=facemesh_debug,
+        )
+        
+        # Load region configuration
+        regions_config = load_facemesh_regions_config(facemesh_regions)
+        
+        # Compute asymmetry
+        facemesh_result = compute_donor_asymmetry_delta(
+            donor_rgb,
+            extractor,
+            regions_config,
+            apply_bias_removal=True,
+            max_delta_px=facemesh_max_delta_px,
+            clamp_percentile=facemesh_clamp_percentile,
+            cheek_radius_px=cheek_radius_px,
+            verbose=True
+        )
+        
+        if facemesh_result.get("ok", False):
+            print("[FaceMesh] ✓ Asymmetry computation successful")
+            
+            # Debug outputs
+            if facemesh_debug:
+                print("[FaceMesh] Saving debug visualizations...")
+                os.makedirs("outputs/diagnostics/facemesh", exist_ok=True)
+                
+                # All landmarks overlay on donor
+                groups = {
+                    "lips": regions_config["lips"],
+                    "face_oval": regions_config["face_oval"],
+                    "cheek_patch": facemesh_result.get("cheek_patch", []),
+                    "anchors": regions_config["anchors"],
+                }
+                draw_facemesh_overlay(
+                    donor_rgb,
+                    facemesh_result["L_d"],
+                    groups,
+                    "outputs/diagnostics/facemesh/donor_facemesh_all.png",
+                    label_some=True
+                )
+                
+                # Flipped donor landmarks
+                draw_facemesh_overlay(
+                    donor_rgb[:, ::-1, :].copy(),
+                    facemesh_result["L_f"],
+                    groups,
+                    "outputs/diagnostics/facemesh/donor_flip_facemesh_all.png",
+                    label_some=False
+                )
+                
+                # Comparison: flip-back vs original on donor image
+                draw_comparison_overlay(
+                    donor_rgb,
+                    facemesh_result["L_d"],
+                    facemesh_result["L_f_back"],
+                    "outputs/diagnostics/facemesh/donor_flip_back_overlay.png",
+                    label_1="donor_original",
+                    label_2="flip_mirrored_back"
+                )
+                
+                # Indexed alignment visualization (if permutation available)
+                if facemesh_result.get("flipback_perm") is not None:
+                    draw_flipback_indexed_lines(
+                        donor_rgb,
+                        facemesh_result["L_d"],
+                        facemesh_result["L_f_back"],
+                        num_indices=50,
+                        out_path="outputs/diagnostics/facemesh/donor_flip_back_indexed_lines.png"
+                    )
+                
+                # Regions visualization
+                draw_facemesh_overlay(
+                    donor_rgb,
+                    facemesh_result["L_d"],
+                    groups,
+                    "outputs/diagnostics/facemesh/regions_overlay.png",
+                    label_some=True
+                )
+                
+                # Delta heatmap
+                roi_union = set(
+                    regions_config["lips"] +
+                    regions_config["face_oval"] +
+                    facemesh_result.get("cheek_patch", [])
+                )
+                roi_union = sorted(list(roi_union))
+                draw_delta_heatmap(
+                    donor_rgb,
+                    facemesh_result["L_d"],
+                    facemesh_result["delta"],
+                    roi_union,
+                    "outputs/diagnostics/facemesh/delta_heatmap.png",
+                    scale_px=320.0
+                )
+                
+                print("[FaceMesh] ✓ Debug visualizations saved")
+            
+            # Save numpy dumps
+            if facemesh_save_npy:
+                save_facemesh_numpy_dumps(facemesh_result)
+                save_facemesh_summary(facemesh_result)
+        else:
+            print("[FaceMesh] ✗ Asymmetry computation failed, continuing without FaceMesh")
+            facemesh_driving = False
 
     # get target keypoints in canonical coords to define left/right etc
     T = wrap.prepare_source(target_rgb)
@@ -628,6 +827,83 @@ def main(
         if int(edge_mask.sum()) > 0:
             exp_delta[0, edge_mask, 0] = 0.0
     S2 = exp_delta.clone()
+
+    # =========================================================================
+    # FACEMESH EXPRESSION ASSIST (pre_gain injection point)
+    # =========================================================================
+    if facemesh_exp_assist and facemesh_exp_inject_stage == "pre_gain":
+        try:
+            # Compute mouth stats BEFORE injection
+            exp_delta_before_inject = exp_delta.clone()
+            mouth_kp_idx = [idx for idx in LIP_IDX + LIP_CORNER_IDX if 0 <= idx < exp_delta.shape[1]]
+            if len(mouth_kp_idx) > 0:
+                mouth_delta_before = exp_delta_before_inject[0, mouth_kp_idx, :2]
+                mouth_mag_before = torch.linalg.norm(mouth_delta_before, dim=1)
+                mag_mean_before = float(mouth_mag_before.mean())
+                mag_max_before = float(mouth_mag_before.max())
+            else:
+                mag_mean_before = 0.0
+                mag_max_before = 0.0
+            
+            # Get LP keypoints in pixel space for projection
+            target_kp_pixels_for_fm = kp_to_pixels(kp_can_t[:, :2], target_rgb.shape[0], target_rgb.shape[1])
+            
+            # Get or create extractor
+            if facemesh_driving and 'extractor' in locals():
+                fm_extractor = extractor
+            else:
+                fm_extractor = FaceMeshLandmarkExtractor(
+                    static_image_mode=True,
+                    max_num_faces=1,
+                    verbose=False,
+                    refine_landmarks=facemesh_refine,
+                    debug=False,
+                )
+            
+            # Apply FaceMesh expression assist
+            exp_delta_fm, fm_debug_dict = apply_facemesh_exp_assist(
+                target_rgb=target_rgb,
+                target_kp_px=target_kp_pixels_for_fm,
+                extractor=fm_extractor,
+                beta=beta,
+                method=facemesh_exp_method,
+                knn_k=facemesh_exp_knn_k,
+                smooth=facemesh_exp_smooth,
+                max_disp_px=facemesh_exp_max_disp_px,
+                debug=facemesh_exp_debug,
+                verbose=verbose,
+            )
+            
+            if exp_delta_fm is not None:
+                # Add FaceMesh correction to exp_delta BEFORE gains/compression
+                exp_delta = exp_delta + exp_delta_fm
+                
+                # Compute mouth stats AFTER injection
+                mouth_delta_after = exp_delta[0, mouth_kp_idx, :2]
+                mouth_mag_after = torch.linalg.norm(mouth_delta_after, dim=1)
+                mag_mean_after = float(mouth_mag_after.mean())
+                mag_max_after = float(mouth_mag_after.max())
+                
+                # Log
+                print(f"[FaceMesh-EXP] inject_stage=pre_gain: adding mouth residual BEFORE gains/compression")
+                print(f"[FaceMesh-EXP]   mouth magnitude: before_inject mean={mag_mean_before:.3f}px max={mag_max_before:.3f}px")
+                print(f"[FaceMesh-EXP]   mouth magnitude: after_inject  mean={mag_mean_after:.3f}px max={mag_max_after:.3f}px")
+                
+                # Save debug artifacts if requested
+                if facemesh_exp_debug:
+                    try:
+                        exp_delta_before_np = exp_delta_before_inject.detach().cpu().numpy()
+                        exp_delta_after_np = exp_delta.detach().cpu().numpy()
+                        os.makedirs("outputs/diagnostics/facemesh_exp_assist", exist_ok=True)
+                        np.save("outputs/diagnostics/facemesh_exp_assist/exp_delta_before_inject.npy", exp_delta_before_np)
+                        np.save("outputs/diagnostics/facemesh_exp_assist/exp_delta_after_inject.npy", exp_delta_after_np)
+                    except Exception as e:
+                        print(f"[FaceMesh-EXP] Warning: Failed to save debug artifacts: {e}")
+        except Exception as e:
+            print(f"[FaceMesh-EXP] Error in pre_gain injection: {e}")
+            if verbose:
+                import traceback
+                traceback.print_exc()
 
     # region specific control
     mouth_mask = None
@@ -795,6 +1071,57 @@ def main(
             corner_mask2[idx] = True
     stable = ~(lips_mask2 | corner_mask2)
 
+    # =========================================================================
+    # FACEMESH EXPRESSION ASSIST (pre_drift injection point)
+    # =========================================================================
+    if facemesh_exp_assist and facemesh_exp_inject_stage == "pre_drift":
+        print("\n[FaceMesh Exp Assist] Applying pre-drift correction...")
+        try:
+            # Get LP keypoints in pixel space for projection
+            target_kp_pixels_for_fm = kp_to_pixels(kp_can_t[:, :2], target_rgb.shape[0], target_rgb.shape[1])
+            
+            # Get or create extractor (reuse if facemesh_driving created one)
+            if facemesh_driving and 'extractor' in locals():
+                fm_extractor = extractor
+            else:
+                fm_extractor = FaceMeshLandmarkExtractor(
+                    static_image_mode=True,
+                    max_num_faces=1,
+                    verbose=False,
+                    refine_landmarks=facemesh_refine,
+                    debug=False,
+                )
+            
+            exp_delta_fm, fm_debug_dict = apply_facemesh_exp_assist(
+                donor_rgb=donor_rgb,
+                target_rgb=target_rgb,
+                exp_delta=exp_delta,
+                extractor=fm_extractor,
+                lp_keypoints_px=target_kp_pixels_for_fm,
+                beta=facemesh_exp_beta,
+                mouth_alpha=facemesh_exp_mouth_alpha,
+                method=facemesh_exp_method,
+                knn_k=facemesh_exp_knn_k,
+                tps_reg=1e-3,
+                inject_stage=facemesh_exp_inject_stage,
+                debug=facemesh_exp_debug,
+                lips_mask_indices=LIP_IDX,
+                corner_mask_indices=LIP_CORNER_IDX,
+                verbose=True,
+            )
+            
+            if exp_delta_fm is not None and fm_debug_dict.get("ok", False):
+                exp_delta = exp_delta + exp_delta_fm
+                print(f"[FaceMesh Exp Assist] [OK] Applied correction (shape: {tuple(exp_delta_fm.shape)})")
+            else:
+                error_msg = fm_debug_dict.get("error", "unknown")
+                print(f"[FaceMesh Exp Assist] [SKIP] Skipped (stub or error: {error_msg})")
+                
+        except Exception as e:
+            print(f"[FaceMesh Exp Assist] [FAIL] Exception: {e}")
+            import traceback
+            traceback.print_exc()
+
     dy = exp_delta[0, :, 1]
     if y_drift_fix != "none":
         if y_drift_fix == "nonmouth" and stable.any():
@@ -897,6 +1224,59 @@ def main(
     if (post_norm > cap) and (cap > 1e-8):
         exp_delta *= (cap / post_norm)
 
+    # =========================================================================
+    # FACEMESH EXPRESSION ASSIST (post_drift injection point)
+    # =========================================================================
+    if facemesh_exp_assist and facemesh_exp_inject_stage == "post_drift":
+        print("\n[FaceMesh Exp Assist] Applying post-drift correction...")
+        try:
+            # Get LP keypoints in pixel space for projection
+            target_kp_pixels_for_fm = kp_to_pixels(kp_can_t[:, :2], target_rgb.shape[0], target_rgb.shape[1])
+            
+            # Get or create extractor (reuse if facemesh_driving created one)
+            if facemesh_driving and 'extractor' in locals():
+                fm_extractor = extractor
+            else:
+                fm_extractor = FaceMeshLandmarkExtractor(
+                    static_image_mode=True,
+                    max_num_faces=1,
+                    verbose=False,
+                    refine_landmarks=facemesh_refine,
+                    debug=False,
+                )
+            
+            exp_delta_fm, fm_debug_dict = apply_facemesh_exp_assist(
+                donor_rgb=donor_rgb,
+                target_rgb=target_rgb,
+                exp_delta=exp_delta,
+                extractor=fm_extractor,
+                lp_keypoints_px=target_kp_pixels_for_fm,
+                beta=facemesh_exp_beta,
+                mouth_alpha=facemesh_exp_mouth_alpha,
+                method=facemesh_exp_method,
+                knn_k=facemesh_exp_knn_k,
+                tps_reg=1e-3,
+                inject_stage=facemesh_exp_inject_stage,
+                debug=facemesh_exp_debug,
+                lips_mask_indices=LIP_IDX,
+                corner_mask_indices=LIP_CORNER_IDX,
+                verbose=True,
+            )
+            
+            if exp_delta_fm is not None and fm_debug_dict.get("ok", False):
+                # Combine: exp_delta = exp_delta + beta * exp_delta_fm
+                # (beta is already applied inside apply_facemesh_exp_assist, so just add)
+                exp_delta = exp_delta + exp_delta_fm
+                print(f"[FaceMesh Exp Assist] [OK] Applied correction (shape: {tuple(exp_delta_fm.shape)})")
+            else:
+                error_msg = fm_debug_dict.get("error", "unknown")
+                print(f"[FaceMesh Exp Assist] [SKIP] Skipped (stub or error: {error_msg})")
+                
+        except Exception as e:
+            print(f"[FaceMesh Exp Assist] [FAIL] Exception: {e}")
+            import traceback
+            traceback.print_exc()
+
     # inject delta into target keypoints and render
     T_kp_mod = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in T_kp.items()}
     T_kp_mod["exp"] = T_kp_mod["exp"] + exp_delta
@@ -945,6 +1325,183 @@ def main(
             draw_lip_metrics_overlay(target_rgb, target_before_metrics, osp.join(lip_dir, "target_before_lip_metrics.png"))
         if target_after_metrics is not None:
             draw_lip_metrics_overlay(img_asym, target_after_metrics, osp.join(lip_dir, "target_after_lip_metrics.png"))
+
+    # =========================================================================
+    # PHASE 3-5: FACEMESH WARP POST-PROCESS
+    # =========================================================================
+    # Apply post-process warp to transfer donor asymmetry using dense FaceMesh control points
+    
+    if facemesh_driving and facemesh_warp:
+        print("\n[FaceMesh Warp] Starting post-process warp phase...")
+        
+        try:
+            # Extract landmarks on LivePortrait output (target_after)
+            ok_out, L_out, L_out_vis = extractor.extract(img_asym)
+            
+            if not ok_out:
+                print("[FaceMesh Warp] ✗ Failed to extract landmarks on output image, skipping warp")
+            else:
+                print(f"[FaceMesh Warp] ✓ Extracted {len(L_out)} landmarks on output image")
+                
+                # Apply warp
+                warp_output_dir = "outputs/diagnostics/facemesh_warp"
+                os.makedirs(warp_output_dir, exist_ok=True)
+
+                guard_enable = facemesh_guards if facemesh_guards is not None else facemesh_warp
+                guard_args = {
+                    "guard_max_delta_px": guard_max_delta_px,
+                    "guard_cap_percentile": guard_cap_percentile,
+                    "guard_cap_region": guard_cap_region,
+                    "guard_cap_after_align": guard_cap_after_align,
+                    "guard_smooth_delta": guard_smooth_delta,
+                    "guard_smooth_iterations": guard_smooth_iterations,
+                    "guard_smooth_lambda": guard_smooth_lambda,
+                    "guard_smooth_mode": guard_smooth_mode,
+                    "guard_knn_k": guard_knn_k,
+                    "guard_zero_anchor": guard_zero_anchor,
+                    "guard_anchor_idx": guard_anchor_idx,
+                    "guard_anchor_strength": guard_anchor_strength,
+                    "guard_softmask": guard_softmask,
+                    "guard_softmask_sigma": guard_softmask_sigma,
+                    "guard_softmask_forehead_fade": guard_softmask_forehead_fade,
+                    "guard_softmask_forehead_yfrac": guard_softmask_forehead_yfrac,
+                    "guard_softmask_min": guard_softmask_min,
+                    "guard_softmask_max": guard_softmask_max,
+                    "guard_face_mask": guard_face_mask,
+                    "guard_face_mask_mode": guard_face_mask_mode,
+                    "guard_face_mask_dilate": guard_face_mask_dilate,
+                    "guard_face_mask_erode": guard_face_mask_erode,
+                    "guard_face_mask_blur": guard_face_mask_blur,
+                    "guard_warp_face_only": guard_warp_face_only,
+                    "guard_mouth_only": guard_mouth_only,
+                    "guard_mouth_radius_px": guard_mouth_radius_px,
+                    "guard_alpha_start": guard_alpha_start,
+                    "facemesh_guard_debug": facemesh_guard_debug,
+                    "facemesh_warp_alpha": facemesh_warp_alpha,
+                }
+
+                if guard_face_mask_mode != "hull":
+                    print("[FaceMesh Guard] segmentation mode not implemented; falling back to hull")
+                    guard_args["guard_face_mask_mode"] = "hull"
+                if guard_smooth_mode not in ["knn", "graph"]:
+                    print("[FaceMesh Guard] Unknown smooth mode; using knn")
+                    guard_args["guard_smooth_mode"] = "knn"
+                if guard_mouth_only and facemesh_warp_alpha > max(guard_alpha_start, 0.6):
+                    print("[FaceMesh Guard] Warning: mouth-only mode works best with alpha <= 0.6")
+                
+                ok_warp, img_asym_warped, warp_summary = apply_facemesh_warp(
+                    img_asym,
+                    facemesh_result["L_d"],
+                    facemesh_result["delta"],
+                    facemesh_result["weights"],
+                    L_out,
+                    L_out_vis=L_out_vis,
+                    alpha=facemesh_warp_alpha,
+                    reg=facemesh_warp_reg,
+                    grid_step=facemesh_warp_grid_step,
+                    lock_boundary=facemesh_warp_lock_boundary,
+                    verbose=True,
+                    output_dir=warp_output_dir,
+                    guards=guard_enable,
+                    guard_args=guard_args,
+                    regions_config=regions_config,
+                    guard_output_dir=os.path.join(warp_output_dir, "guards"),
+                    save_debug=facemesh_debug
+                )
+                
+                if ok_warp and img_asym_warped is not None:
+                    print("[FaceMesh Warp] ✓ Warp succeeded")
+                    
+                    # Apply warp result to img_asym for downstream processing
+                    img_asym = img_asym_warped
+                    
+                    # Save displacement field if requested
+                    if facemesh_warp_save_field and "disp_field" in warp_summary:
+                        np.save(
+                            osp.join(warp_output_dir, "disp_field.npy"),
+                            warp_summary["disp_field"]
+                        )
+                    
+                    # Run validation if enabled
+                    if facemesh_warp_validate:
+                        print("[FaceMesh Warp] Running validation...")
+                        
+                        # Compute target landmarks for all control points
+                        # Use the aligned delta from warp computation for correctness
+                        L_out_target = L_out.copy()
+                        delta_out_aligned = warp_summary.get("delta_out_aligned", None)
+                        
+                        if delta_out_aligned is None:
+                            # Fallback: recompute (should not happen in normal flow)
+                            delta_out_aligned = facemesh_result["delta"] @ warp_summary.get("sR", np.eye(2))
+                        
+                        sel_idx_validate = np.where(facemesh_result["weights"] > 0)[0]
+                        for idx in sel_idx_validate:
+                            if 0 <= idx < 468:
+                                L_out_target[idx] = L_out[idx] + facemesh_warp_alpha * delta_out_aligned[idx]
+                        
+                        validation = validate_warp(
+                            img_asym,
+                            L_out_target,
+                            sel_idx_validate,
+                            extractor,
+                            output_dir=warp_output_dir,
+                            verbose=True
+                        )
+                        
+                        warp_summary.update(validation)
+
+                    # Phase 7: evaluation metrics
+                    metrics_summary = {}
+                    donor_metrics = compute_metrics(facemesh_result.get("L_d") if facemesh_result else None)
+                    out_before_metrics = compute_metrics(L_out)
+                    out_after_metrics = None
+
+                    ok_after_metrics, L_after, _ = extractor.extract(img_asym)
+                    if ok_after_metrics:
+                        out_after_metrics = compute_metrics(L_after)
+
+                    metrics_summary["donor"] = donor_metrics
+                    metrics_summary["out_before"] = out_before_metrics
+                    metrics_summary["out_after"] = out_after_metrics
+
+                    def _fmt_metrics(name: str, m: Optional[Dict[str, float]]) -> str:
+                        if m is None:
+                            return f"{name}: score=N/A"
+                        return (
+                            f"{name}: score={m['score']:.3f}, "
+                            f"droop={m['droop']:.3f}, tilt={m['tilt_deg']:.3f}, "
+                            f"cheek={m['cheek_diff']:.3f}, sag={m['sag']:.3f}"
+                        )
+
+                    print("\nFACEMESH ASYMMETRY METRICS")
+                    print("  " + _fmt_metrics("donor", donor_metrics))
+                    print("  " + _fmt_metrics("out_before", out_before_metrics))
+                    print("  " + _fmt_metrics("out_after", out_after_metrics))
+
+                    metrics_path = osp.join(warp_output_dir, "metrics.json")
+                    with open(metrics_path, "w") as f:
+                        json.dump(metrics_summary, f, indent=2)
+                    warp_summary["metrics_path"] = metrics_path
+                    
+                    # Save warp summary
+                    summary_path = osp.join(warp_output_dir, "warp_summary.json")
+                    summary_to_save = {
+                        k: v for k, v in warp_summary.items()
+                        if isinstance(v, (int, float, str, bool, type(None)))
+                    }
+                    with open(summary_path, "w") as f:
+                        json.dump(summary_to_save, f, indent=2)
+                    
+                    print(f"[FaceMesh Warp] ✓ Summary saved to {summary_path}")
+                else:
+                    print("[FaceMesh Warp] ✗ Warp failed, using original output")
+                    warp_summary.update({"warp_succeeded": False})
+        
+        except Exception as e:
+            print(f"[FaceMesh Warp] Error: {e}")
+            import traceback
+            traceback.print_exc()
 
     # save diagnostics
     os.makedirs("outputs/diagnostics", exist_ok=True)
@@ -1026,6 +1583,152 @@ if __name__ == "__main__":
     ap.add_argument("--y_drift_mouth_bias", type=float, default=0.0)
     # Debug: quantify mouth opening (gap) and corner spread (width) for stroke-related asymmetry checks
     ap.add_argument("--lip-metrics", action="store_true", help="Compute lip gap/width metrics and debug overlay.")
+    
+    # FaceMesh-based asymmetry analysis
+    ap.add_argument("--facemesh-driving", action="store_true",
+                    help="Enable MediaPipe FaceMesh-based donor asymmetry analysis.")
+    ap.add_argument("--facemesh-debug", action="store_true",
+                    help="Save FaceMesh debug visualizations (overlays, heatmaps).")
+    ap.add_argument("--facemesh-regions", type=str, default=None,
+                    help="Path to JSON config for FaceMesh region indices.")
+    ap.add_argument("--facemesh-max-delta-px", type=float, default=None,
+                    help="Absolute maximum delta magnitude in pixels (default: percentile-based).")
+    ap.add_argument("--facemesh-clamp-percentile", type=float, default=98.0,
+                    help="Percentile for auto-clamping delta magnitudes (default: 98).")
+    ap.add_argument("--facemesh-save-npy", action="store_true",
+                    help="Save FaceMesh numpy arrays and summary JSON.")
+    ap.add_argument("--cheek-radius-px", type=float, default=None,
+                    help="Override radius for dynamic cheek patch in pixels.")
+    ap.add_argument("--facemesh-refine", action="store_true",
+                    help="Use refined FaceMesh landmarks (if supported).")
+    
+    # FaceMesh Expression Assist - inject FaceMesh mouth signal into exp_delta
+    ap.add_argument("--facemesh-exp-assist", action="store_true",
+                    help="Enable FaceMesh-based mouth correction in exp_delta pipeline.")
+    ap.add_argument("--facemesh-exp-beta", type=float, default=1.0,
+                    help="Overall scaling factor for FaceMesh exp correction (default 1.0).")
+    ap.add_argument("--facemesh-exp-mouth-alpha", type=float, default=1.0,
+                    help="Extra scaling for mouth region (default 1.0).")
+    ap.add_argument("--facemesh-exp-method", type=str, default="knn", choices=["knn", "tps", "basis"],
+                    help="Projection method: 'knn' (default), 'tps', or 'basis' (shape-preserving).")
+    ap.add_argument("--facemesh-exp-knn-k", type=int, default=8,
+                    help="K for KNN projection (default 8).")
+    ap.add_argument("--facemesh-exp-inject-stage", type=str, default="post_drift",
+                    choices=["pre_gain", "pre_drift", "post_drift"],
+                    help="When to inject FaceMesh correction: 'pre_gain' (before gains), 'pre_drift' (before drift fix), or 'post_drift' (default).")
+    ap.add_argument("--facemesh-exp-debug", action="store_true",
+                    help="Save FaceMesh exp assist debug outputs (JSON summary).")
+    # FaceMesh Expression Assist - Guardrails (Phase 3)
+    ap.add_argument("--facemesh-exp-max-disp-px", type=float, default=None,
+                    help="Absolute cap for displacement magnitude in pixels. If not set, uses percentile.")
+    ap.add_argument("--facemesh-exp-cap-percentile", type=float, default=98.0,
+                    help="Percentile for auto-cap of displacements (default 98.0, range 0-100).")
+    ap.add_argument("--facemesh-exp-smooth", dest="facemesh_exp_smooth",
+                    action="store_true", help="Enable KNN-based smoothing of lip displacements (default: True).")
+    ap.add_argument("--no-facemesh-exp-smooth", dest="facemesh_exp_smooth",
+                    action="store_false", help="Disable KNN-based smoothing of lip displacements.")
+    ap.set_defaults(facemesh_exp_smooth=True)
+    ap.add_argument("--facemesh-exp-smooth-k", type=int, default=6,
+                    help="K for smoothing neighbors (default 6).")
+    ap.add_argument("--facemesh-exp-zero-stable", action="store_true", default=True,
+                    help="Zero out non-mouth keypoints (default: True, prevents 'cursed' outputs).")
+
+    # FaceMesh-based post-process warp (Phase 3-5)
+    ap.add_argument("--facemesh-warp", action="store_true",
+                    help="Enable post-process warp to transfer donor asymmetry to output.")
+    ap.add_argument("--facemesh-warp-method", type=str, default="tps", choices=["tps", "pwa"],
+                    help="Warp method: 'tps' (Thin Plate Spline, default) or 'pwa' (piecewise affine).")
+    ap.add_argument("--facemesh-warp-alpha", type=float, default=1.0,
+                    help="Warp strength (0-1, default 1.0). Lower = weaker deformation.")
+    ap.add_argument("--facemesh-warp-reg", type=float, default=1e-3,
+                    help="TPS regularization parameter (default 1e-3). Higher = smoother.")
+    ap.add_argument("--facemesh-warp-grid-step", type=int, default=2,
+                    help="TPS coarse-to-fine grid step (default 2). 1=full resolution, higher=faster.")
+    ap.add_argument("--facemesh-warp-lock-boundary", dest="facemesh_warp_lock_boundary",
+                    action="store_true", help="Lock boundary points during warp")
+    ap.add_argument("--no-facemesh-warp-lock-boundary", dest="facemesh_warp_lock_boundary",
+                    action="store_false", help="Disable boundary locking during warp")
+    ap.set_defaults(facemesh_warp_lock_boundary=True)
+    ap.add_argument("--facemesh-warp-validate", action="store_true", default=True,
+                    help="Validate warp by re-running FaceMesh on warped output (default: True).")
+    ap.add_argument("--facemesh-warp-save-field", action="store_true",
+                    help="Save displacement field as numpy array for inspection.")
+
+    # Phase 6: Guardrails
+    ap.add_argument("--facemesh-guards", dest="facemesh_guards", action="store_true", default=None,
+                    help="Enable guardrails (defaults to True when facemesh-warp is on).")
+    ap.add_argument("--no-facemesh-guards", dest="facemesh_guards", action="store_false", default=None,
+                    help="Disable guardrails explicitly.")
+    ap.add_argument("--facemesh-guard-debug", action="store_true",
+                    help="Save guardrail debug artifacts (masks, capped deltas).")
+    ap.add_argument("--guard-max-delta-px", type=float, default=None,
+                    help="Absolute per-point delta cap (px). If None, use percentile cap.")
+    ap.add_argument("--guard-cap-percentile", type=float, default=98.0,
+                    help="Percentile for automatic cap (default 98).")
+    ap.add_argument("--guard-cap-region", type=str, default="weighted_only", choices=["weighted_only", "all"],
+                    help="Which points to consider when computing cap.")
+    ap.add_argument("--guard-cap-after-align", action="store_true", default=True,
+                    help="Apply cap after delta alignment (default True).")
+    ap.add_argument("--no-guard-cap-after-align", dest="guard_cap_after_align", action="store_false",
+                    help="Skip cap after alignment.")
+    ap.add_argument("--guard-smooth-delta", action="store_true", default=True,
+                    help="Enable spatial smoothing of delta (default True).")
+    ap.add_argument("--no-guard-smooth-delta", dest="guard_smooth_delta", action="store_false",
+                    help="Disable spatial smoothing.")
+    ap.add_argument("--guard-smooth-iterations", type=int, default=2,
+                    help="Number of smoothing iterations (default 2).")
+    ap.add_argument("--guard-smooth-lambda", type=float, default=0.6,
+                    help="Smoothing blend factor (0-1, default 0.6).")
+    ap.add_argument("--guard-smooth-mode", type=str, default="knn", choices=["knn", "graph"],
+                    help="Smoothing mode (default knn).")
+    ap.add_argument("--guard-knn-k", type=int, default=8,
+                    help="K for KNN smoothing (default 8).")
+    ap.add_argument("--guard-zero-anchor", action="store_true", default=True,
+                    help="Dampen anchor deltas toward zero (default True).")
+    ap.add_argument("--no-guard-zero-anchor", dest="guard_zero_anchor", action="store_false",
+                    help="Disable anchor damping.")
+    ap.add_argument("--guard-anchor-idx", type=int, nargs="*", default=None,
+                    help="Optional override for anchor indices (space-separated list).")
+    ap.add_argument("--guard-anchor-strength", type=float, default=0.95,
+                    help="Anchor damping strength (default 0.95).")
+    ap.add_argument("--guard-softmask", action="store_true", default=True,
+                    help="Enable soft effect mask (default True).")
+    ap.add_argument("--no-guard-softmask", dest="guard_softmask", action="store_false",
+                    help="Disable soft effect mask.")
+    ap.add_argument("--guard-softmask-sigma", type=float, default=25.0,
+                    help="Gaussian sigma for soft mask (px).")
+    ap.add_argument("--guard-softmask-forehead-fade", action="store_true", default=True,
+                    help="Fade mask near forehead (default True).")
+    ap.add_argument("--no-guard-softmask-forehead-fade", dest="guard_softmask_forehead_fade", action="store_false",
+                    help="Disable forehead fade in mask.")
+    ap.add_argument("--guard-softmask-forehead-yfrac", type=float, default=0.22,
+                    help="Top fraction to fade mask (default 0.22).")
+    ap.add_argument("--guard-softmask-min", type=float, default=0.0,
+                    help="Minimum mask value after clamping (default 0.0).")
+    ap.add_argument("--guard-softmask-max", type=float, default=1.0,
+                    help="Maximum mask value after clamping (default 1.0).")
+    ap.add_argument("--guard-face-mask", action="store_true", default=True,
+                    help="Enable face hull mask (default True).")
+    ap.add_argument("--no-guard-face-mask", dest="guard_face_mask", action="store_false",
+                    help="Disable face hull mask.")
+    ap.add_argument("--guard-face-mask-mode", type=str, default="hull", choices=["hull", "segmentation"],
+                    help="Face mask mode (segmentation not implemented, hull default).")
+    ap.add_argument("--guard-face-mask-dilate", type=int, default=12,
+                    help="Dilation pixels for face mask (default 12).")
+    ap.add_argument("--guard-face-mask-erode", type=int, default=0,
+                    help="Erode pixels for face mask (default 0).")
+    ap.add_argument("--guard-face-mask-blur", type=int, default=11,
+                    help="Gaussian blur kernel for face mask (odd, default 11).")
+    ap.add_argument("--guard-warp-face-only", action="store_true", default=True,
+                    help="Composite warped face onto original background (default True).")
+    ap.add_argument("--no-guard-warp-face-only", dest="guard_warp_face_only", action="store_false",
+                    help="Disable face-only compositing.")
+    ap.add_argument("--guard-mouth-only", action="store_true",
+                    help="Mouth-only MVP warp (default False).")
+    ap.add_argument("--guard-mouth-radius-px", type=int, default=90,
+                    help="Mouth-only mask radius in pixels (default 90).")
+    ap.add_argument("--guard-alpha-start", type=float, default=0.3,
+                    help="Recommended starting alpha for mouth-only (default 0.3).")
 
     a = ap.parse_args()
     main(
@@ -1056,4 +1759,61 @@ if __name__ == "__main__":
         y_anchor=a.y_anchor,
         y_drift_mouth_bias=a.y_drift_mouth_bias,
         lip_metrics=a.lip_metrics,
+        facemesh_driving=a.facemesh_driving,
+        facemesh_debug=a.facemesh_debug,
+        facemesh_regions=a.facemesh_regions,
+        facemesh_max_delta_px=a.facemesh_max_delta_px,
+        facemesh_clamp_percentile=a.facemesh_clamp_percentile,
+        facemesh_save_npy=a.facemesh_save_npy,
+        cheek_radius_px=a.cheek_radius_px,
+        facemesh_refine=a.facemesh_refine,
+        facemesh_exp_assist=a.facemesh_exp_assist,
+        facemesh_exp_beta=a.facemesh_exp_beta,
+        facemesh_exp_mouth_alpha=a.facemesh_exp_mouth_alpha,
+        facemesh_exp_method=a.facemesh_exp_method,
+        facemesh_exp_knn_k=a.facemesh_exp_knn_k,
+        facemesh_exp_inject_stage=a.facemesh_exp_inject_stage,
+        facemesh_exp_debug=a.facemesh_exp_debug,
+        facemesh_exp_max_disp_px=a.facemesh_exp_max_disp_px,
+        facemesh_exp_cap_percentile=a.facemesh_exp_cap_percentile,
+        facemesh_exp_smooth=a.facemesh_exp_smooth,
+        facemesh_exp_smooth_k=a.facemesh_exp_smooth_k,
+        facemesh_exp_zero_stable=a.facemesh_exp_zero_stable,
+        facemesh_warp=a.facemesh_warp,
+        facemesh_warp_method=a.facemesh_warp_method,
+        facemesh_warp_alpha=a.facemesh_warp_alpha,
+        facemesh_warp_reg=a.facemesh_warp_reg,
+        facemesh_warp_grid_step=a.facemesh_warp_grid_step,
+        facemesh_warp_lock_boundary=a.facemesh_warp_lock_boundary,
+        facemesh_warp_validate=a.facemesh_warp_validate,
+        facemesh_warp_save_field=a.facemesh_warp_save_field,
+        facemesh_guards=a.facemesh_guards,
+        facemesh_guard_debug=a.facemesh_guard_debug,
+        guard_max_delta_px=a.guard_max_delta_px,
+        guard_cap_percentile=a.guard_cap_percentile,
+        guard_cap_region=a.guard_cap_region,
+        guard_cap_after_align=a.guard_cap_after_align,
+        guard_smooth_delta=a.guard_smooth_delta,
+        guard_smooth_iterations=a.guard_smooth_iterations,
+        guard_smooth_lambda=a.guard_smooth_lambda,
+        guard_smooth_mode=a.guard_smooth_mode,
+        guard_knn_k=a.guard_knn_k,
+        guard_zero_anchor=a.guard_zero_anchor,
+        guard_anchor_idx=a.guard_anchor_idx,
+        guard_anchor_strength=a.guard_anchor_strength,
+        guard_softmask=a.guard_softmask,
+        guard_softmask_sigma=a.guard_softmask_sigma,
+        guard_softmask_forehead_fade=a.guard_softmask_forehead_fade,
+        guard_softmask_forehead_yfrac=a.guard_softmask_forehead_yfrac,
+        guard_softmask_min=a.guard_softmask_min,
+        guard_softmask_max=a.guard_softmask_max,
+        guard_face_mask=a.guard_face_mask,
+        guard_face_mask_mode=a.guard_face_mask_mode,
+        guard_face_mask_dilate=a.guard_face_mask_dilate,
+        guard_face_mask_erode=a.guard_face_mask_erode,
+        guard_face_mask_blur=a.guard_face_mask_blur,
+        guard_warp_face_only=a.guard_warp_face_only,
+        guard_mouth_only=a.guard_mouth_only,
+        guard_mouth_radius_px=a.guard_mouth_radius_px,
+        guard_alpha_start=a.guard_alpha_start,
     )
