@@ -59,7 +59,7 @@ def run_warp_pipeline(
 ):
     """
     Apply full FaceMesh warp pipeline.
-    
+
     Args:
         donor_path: Path to donor image (with asymmetry)
         target_after_path: Path to target image (LivePortrait output or input)
@@ -70,13 +70,13 @@ def run_warp_pipeline(
         lock_boundary: Lock image boundaries
         validate: Run validation
         verbose: Print progress
-    
+
     Returns:
         Dictionary with results and stats
     """
-    
+
     os.makedirs(output_dir, exist_ok=True)
-    
+
     if verbose:
         print(f"\n{'='*70}")
         print("FaceMesh Warp Pipeline Example")
@@ -85,36 +85,36 @@ def run_warp_pipeline(
         print(f"Target: {target_after_path}")
         print(f"Output: {output_dir}")
         print(f"Params: alpha={alpha}, reg={reg}, grid_step={grid_step}")
-    
+
     # Load images
     if verbose:
         print("\n[1/6] Loading images...")
-    
+
     donor_rgb = read_rgb(donor_path)
     target_rgb = read_rgb(target_after_path)
-    
+
     H, W = target_rgb.shape[:2]
     if verbose:
         print(f"  Donor shape: {donor_rgb.shape}")
         print(f"  Target shape: {target_rgb.shape}")
-    
+
     # Initialize FaceMesh extractor
     if verbose:
         print("\n[2/6] Initializing FaceMesh...")
-    
+
     extractor = FaceMeshLandmarkExtractor(
         static_image_mode=True,
         max_num_faces=1,
         verbose=verbose,
         refine_landmarks=False
     )
-    
+
     # Compute donor asymmetry
     if verbose:
         print("\n[3/6] Computing donor asymmetry...")
-    
+
     regions_config = load_facemesh_regions_config(None)
-    
+
     facemesh_result = compute_donor_asymmetry_delta(
         donor_rgb,
         extractor,
@@ -124,36 +124,36 @@ def run_warp_pipeline(
         clamp_percentile=98.0,
         verbose=verbose
     )
-    
+
     if not facemesh_result.get("ok", False):
         print("✗ Failed to compute donor asymmetry")
         return {"ok": False}
-    
+
     if verbose:
         print(f"  ✓ Asymmetry computed")
         print(f"    L_d shape: {facemesh_result['L_d'].shape}")
         print(f"    delta shape: {facemesh_result['delta'].shape}")
-    
+
     # Extract landmarks on target
     if verbose:
         print("\n[4/6] Extracting landmarks on target image...")
-    
+
     ok_target, L_out, L_out_vis = extractor.extract(target_rgb)
-    
+
     if not ok_target:
         print("✗ Failed to extract landmarks on target")
         return {"ok": False}
-    
+
     if verbose:
         print(f"  ✓ Landmarks extracted")
         print(f"    L_out shape: {L_out.shape}")
-    
+
     # Apply warp
     if verbose:
         print("\n[5/6] Applying TPS warp...")
-    
+
     warp_output_dir = os.path.join(output_dir, "warp_diagnostics")
-    
+
     ok_warp, img_warped, warp_summary = apply_facemesh_warp(
         target_rgb,
         facemesh_result["L_d"],
@@ -168,21 +168,21 @@ def run_warp_pipeline(
         verbose=verbose,
         output_dir=warp_output_dir
     )
-    
+
     if not ok_warp or img_warped is None:
         print("✗ Warp failed")
         return {"ok": False}
-    
+
     if verbose:
         print(f"  ✓ Warp succeeded")
         print(f"    Fold fraction: {warp_summary.get('fold_fraction', 0)*100:.2f}%")
-    
+
     # Validation
     validation = {"success": False}
     if validate:
         if verbose:
             print("\n[6/6] Running validation...")
-        
+
         # Compute target landmarks
         L_out_target = L_out.copy()
         delta_out = facemesh_result["delta"] @ warp_summary.get("sR", np.eye(2))
@@ -190,7 +190,7 @@ def run_warp_pipeline(
         for idx in sel_idx:
             if 0 <= idx < 468:
                 L_out_target[idx] = L_out[idx] + alpha * delta_out[idx]
-        
+
         validation = validate_warp(
             img_warped,
             L_out_target,
@@ -202,14 +202,14 @@ def run_warp_pipeline(
     else:
         if verbose:
             print("\n[6/6] Skipping validation (disabled)")
-    
+
     # Save outputs
     if verbose:
         print("\n[7/7] Saving outputs...")
-    
+
     # Main output
     save_rgb(os.path.join(output_dir, "warped.png"), img_warped)
-    
+
     # Summary
     summary = {
         "ok": True,
@@ -229,12 +229,12 @@ def run_warp_pipeline(
         "validation": validation,
         "output_dir": warp_output_dir,
     }
-    
+
     # Save summary JSON
     summary_path = os.path.join(output_dir, "warp_summary.json")
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
-    
+
     if verbose:
         print(f"\n{'='*70}")
         print("Pipeline complete!")
@@ -246,7 +246,7 @@ def run_warp_pipeline(
             print(f"  Validation error: {validation['mean_error_px']:.2f}px (mean), "
                   f"{validation['max_error_px']:.2f}px (max)")
         print(f"{'='*70}\n")
-    
+
     return summary
 
 
@@ -270,9 +270,9 @@ def main():
                         help="Skip validation")
     parser.add_argument("--quiet", action="store_true",
                         help="Suppress output")
-    
+
     args = parser.parse_args()
-    
+
     result = run_warp_pipeline(
         donor_path=args.donor,
         target_after_path=args.target,
@@ -284,7 +284,7 @@ def main():
         validate=not args.no_validate,
         verbose=not args.quiet,
     )
-    
+
     if not result.get("ok", False):
         sys.exit(1)
 

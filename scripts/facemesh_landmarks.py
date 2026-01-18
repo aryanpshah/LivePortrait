@@ -88,7 +88,7 @@ class FaceMeshLandmarkExtractor:
                  verbose: bool = True, refine_landmarks: bool = False, debug: bool = False):
         """
         Initialize FaceMesh extractor.
-        
+
         Args:
             static_image_mode: If True, use static image mode (video mode not used).
             max_num_faces: Maximum number of faces to detect.
@@ -104,7 +104,7 @@ class FaceMeshLandmarkExtractor:
         self.refine_landmarks = refine_landmarks
         self.debug = debug
         self._face_landmarker = None
-    
+
     def _init_model(self):
         """Lazy initialization of MediaPipe FaceLandmarker."""
         if self._face_landmarker is None:
@@ -123,14 +123,14 @@ class FaceMeshLandmarkExtractor:
                 output_facial_transformation_matrixes=False # Not needed for this task
             )
             self._face_landmarker = vision.FaceLandmarker.create_from_options(options)
-    
+
     def extract(self, img_rgb: np.ndarray) -> Tuple[bool, Optional[np.ndarray], Optional[np.ndarray]]:
         """
         Extract FaceMesh landmarks from RGB image.
-        
+
         Args:
             img_rgb: RGB image as numpy array, shape (H, W, 3), dtype uint8.
-        
+
         Returns:
             Tuple of:
             - ok (bool): True if face detected and landmarks extracted successfully.
@@ -176,18 +176,18 @@ class FaceMeshLandmarkExtractor:
                 if self.verbose:
                     print(f"[FaceMesh] Invalid image shape: {img_rgb.shape}")
                 return False, None, None
-            
+
             # Convert numpy array to MediaPipe Image
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=img_rgb)
-            
+
             # Run FaceLandmarker inference
             results = self._face_landmarker.detect(mp_image)
-            
+
             if not results.face_landmarks or len(results.face_landmarks) == 0:
                 if self.verbose:
                     print("[FaceMesh] No face detected in image")
                 return False, None, None
-            
+
             # Extract first face's landmarks
             face_landmarks = results.face_landmarks[0]
             expected_landmarks = 478 if self.refine_landmarks else 468
@@ -201,32 +201,32 @@ class FaceMeshLandmarkExtractor:
                 num_landmarks = 468
             elif num_landmarks != expected_landmarks and self.verbose:
                 print(f"[FaceMesh] Warning: Expected {expected_landmarks} landmarks, but found {num_landmarks}. This may be due to a model mismatch.")
-            
+
             # Convert normalized [0, 1] coords to pixel coordinates
             lm_px = []
             lm_vis = []
-            
+
             for lm in landmarks_iter:
                 x_norm = lm.x
                 y_norm = lm.y
-                
+
                 # Convert to pixel coordinates
                 x_px = x_norm * (W - 1)
                 y_px = y_norm * (H - 1)
-                
+
                 # Clip to valid range
                 x_px = np.clip(x_px, 0, W - 1)
                 y_px = np.clip(y_px, 0, H - 1)
-                
+
                 lm_px.append([x_px, y_px])
-                
+
                 # Extract visibility if available, otherwise fallback
                 vis = getattr(lm, 'visibility', getattr(lm, 'presence', 1.0))
                 lm_vis.append(vis)
-            
+
             lm_px = np.array(lm_px, dtype=np.float32)
             lm_vis = np.array(lm_vis, dtype=np.float32)
-            
+
             # The new API guarantees 478 landmarks if blendshapes are on, 468 if off.
             # We have blendshapes off, so we expect 468.
             if lm_px.shape[0] != expected_landmarks and self.verbose:
@@ -234,16 +234,16 @@ class FaceMeshLandmarkExtractor:
 
             assert lm_px.shape[1] == 2, f"Expected shape (*, 2), got {lm_px.shape}"
             assert lm_vis.shape[0] == lm_px.shape[0], f"Landmark and visibility count mismatch: {lm_px.shape[0]} vs {lm_vis.shape[0]}"
-            
+
             return True, lm_px, lm_vis
-        
+
         except Exception as e:
             if self.verbose:
                 import traceback
                 print(f"[FaceMesh] Extraction failed: {e}")
                 # traceback.print_exc() # Uncomment for full debug trace
             return False, None, None
-    
+
     def cleanup(self):
         """Release resources."""
         if self._face_landmarker is not None:
@@ -467,7 +467,7 @@ def draw_flipback_indexed_lines(
     for i in selected_indices:
         pt1 = tuple(np.round(L_d[i]).astype(np.int32))
         pt1 = (np.clip(pt1[0], 0, W - 1), np.clip(pt1[1], 0, H - 1))
-        
+
         pt2 = tuple(np.round(L_f_back_perm[i]).astype(np.int32))
         pt2 = (np.clip(pt2[0], 0, W - 1), np.clip(pt2[1], 0, H - 1))
 

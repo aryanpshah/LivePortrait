@@ -626,14 +626,14 @@ def main(
     # read donor (has asymmetry) and target (neutral avatar)
     donor_rgb = read_rgb(donor_path)
     target_rgb = read_rgb(target_path)
-    
+
     # =========================================================================
     # FaceMesh-based donor asymmetry analysis (if enabled)
     # =========================================================================
     facemesh_result = None
     if facemesh_driving:
         print("\n[FaceMesh] Computing donor asymmetry driving signal...")
-        
+
         # Initialize extractor
         extractor = FaceMeshLandmarkExtractor(
             static_image_mode=True,
@@ -642,10 +642,10 @@ def main(
             refine_landmarks=facemesh_refine,
             debug=facemesh_debug,
         )
-        
+
         # Load region configuration
         regions_config = load_facemesh_regions_config(facemesh_regions)
-        
+
         # Compute asymmetry
         facemesh_result = compute_donor_asymmetry_delta(
             donor_rgb,
@@ -657,15 +657,15 @@ def main(
             cheek_radius_px=cheek_radius_px,
             verbose=True
         )
-        
+
         if facemesh_result.get("ok", False):
             print("[FaceMesh] ✓ Asymmetry computation successful")
-            
+
             # Debug outputs
             if facemesh_debug:
                 print("[FaceMesh] Saving debug visualizations...")
                 os.makedirs("outputs/diagnostics/facemesh", exist_ok=True)
-                
+
                 # All landmarks overlay on donor
                 groups = {
                     "lips": regions_config["lips"],
@@ -680,7 +680,7 @@ def main(
                     "outputs/diagnostics/facemesh/donor_facemesh_all.png",
                     label_some=True
                 )
-                
+
                 # Flipped donor landmarks
                 draw_facemesh_overlay(
                     donor_rgb[:, ::-1, :].copy(),
@@ -689,7 +689,7 @@ def main(
                     "outputs/diagnostics/facemesh/donor_flip_facemesh_all.png",
                     label_some=False
                 )
-                
+
                 # Comparison: flip-back vs original on donor image
                 draw_comparison_overlay(
                     donor_rgb,
@@ -699,7 +699,7 @@ def main(
                     label_1="donor_original",
                     label_2="flip_mirrored_back"
                 )
-                
+
                 # Indexed alignment visualization (if permutation available)
                 if facemesh_result.get("flipback_perm") is not None:
                     draw_flipback_indexed_lines(
@@ -709,7 +709,7 @@ def main(
                         num_indices=50,
                         out_path="outputs/diagnostics/facemesh/donor_flip_back_indexed_lines.png"
                     )
-                
+
                 # Regions visualization
                 draw_facemesh_overlay(
                     donor_rgb,
@@ -718,7 +718,7 @@ def main(
                     "outputs/diagnostics/facemesh/regions_overlay.png",
                     label_some=True
                 )
-                
+
                 # Delta heatmap
                 roi_union = set(
                     regions_config["lips"] +
@@ -734,9 +734,9 @@ def main(
                     "outputs/diagnostics/facemesh/delta_heatmap.png",
                     scale_px=320.0
                 )
-                
+
                 print("[FaceMesh] ✓ Debug visualizations saved")
-            
+
             # Save numpy dumps
             if facemesh_save_npy:
                 save_facemesh_numpy_dumps(facemesh_result)
@@ -844,10 +844,10 @@ def main(
             else:
                 mag_mean_before = 0.0
                 mag_max_before = 0.0
-            
+
             # Get LP keypoints in pixel space for projection
             target_kp_pixels_for_fm = kp_to_pixels(kp_can_t[:, :2], target_rgb.shape[0], target_rgb.shape[1])
-            
+
             # Get or create extractor
             if facemesh_driving and 'extractor' in locals():
                 fm_extractor = extractor
@@ -859,7 +859,7 @@ def main(
                     refine_landmarks=facemesh_refine,
                     debug=False,
                 )
-            
+
             # Apply FaceMesh expression assist
             exp_delta_fm, fm_debug_dict = apply_facemesh_exp_assist(
                 target_rgb=target_rgb,
@@ -873,22 +873,22 @@ def main(
                 debug=facemesh_exp_debug,
                 verbose=verbose,
             )
-            
+
             if exp_delta_fm is not None:
                 # Add FaceMesh correction to exp_delta BEFORE gains/compression
                 exp_delta = exp_delta + exp_delta_fm
-                
+
                 # Compute mouth stats AFTER injection
                 mouth_delta_after = exp_delta[0, mouth_kp_idx, :2]
                 mouth_mag_after = torch.linalg.norm(mouth_delta_after, dim=1)
                 mag_mean_after = float(mouth_mag_after.mean())
                 mag_max_after = float(mouth_mag_after.max())
-                
+
                 # Log
                 print(f"[FaceMesh-EXP] inject_stage=pre_gain: adding mouth residual BEFORE gains/compression")
                 print(f"[FaceMesh-EXP]   mouth magnitude: before_inject mean={mag_mean_before:.3f}px max={mag_max_before:.3f}px")
                 print(f"[FaceMesh-EXP]   mouth magnitude: after_inject  mean={mag_mean_after:.3f}px max={mag_max_after:.3f}px")
-                
+
                 # Save debug artifacts if requested
                 if facemesh_exp_debug:
                     try:
@@ -1079,7 +1079,7 @@ def main(
         try:
             # Get LP keypoints in pixel space for projection
             target_kp_pixels_for_fm = kp_to_pixels(kp_can_t[:, :2], target_rgb.shape[0], target_rgb.shape[1])
-            
+
             # Get or create extractor (reuse if facemesh_driving created one)
             if facemesh_driving and 'extractor' in locals():
                 fm_extractor = extractor
@@ -1091,7 +1091,7 @@ def main(
                     refine_landmarks=facemesh_refine,
                     debug=False,
                 )
-            
+
             exp_delta_fm, fm_debug_dict = apply_facemesh_exp_assist(
                 donor_rgb=donor_rgb,
                 target_rgb=target_rgb,
@@ -1109,14 +1109,14 @@ def main(
                 corner_mask_indices=LIP_CORNER_IDX,
                 verbose=True,
             )
-            
+
             if exp_delta_fm is not None and fm_debug_dict.get("ok", False):
                 exp_delta = exp_delta + exp_delta_fm
                 print(f"[FaceMesh Exp Assist] [OK] Applied correction (shape: {tuple(exp_delta_fm.shape)})")
             else:
                 error_msg = fm_debug_dict.get("error", "unknown")
                 print(f"[FaceMesh Exp Assist] [SKIP] Skipped (stub or error: {error_msg})")
-                
+
         except Exception as e:
             print(f"[FaceMesh Exp Assist] [FAIL] Exception: {e}")
             import traceback
@@ -1232,7 +1232,7 @@ def main(
         try:
             # Get LP keypoints in pixel space for projection
             target_kp_pixels_for_fm = kp_to_pixels(kp_can_t[:, :2], target_rgb.shape[0], target_rgb.shape[1])
-            
+
             # Get or create extractor (reuse if facemesh_driving created one)
             if facemesh_driving and 'extractor' in locals():
                 fm_extractor = extractor
@@ -1244,7 +1244,7 @@ def main(
                     refine_landmarks=facemesh_refine,
                     debug=False,
                 )
-            
+
             exp_delta_fm, fm_debug_dict = apply_facemesh_exp_assist(
                 donor_rgb=donor_rgb,
                 target_rgb=target_rgb,
@@ -1262,7 +1262,7 @@ def main(
                 corner_mask_indices=LIP_CORNER_IDX,
                 verbose=True,
             )
-            
+
             if exp_delta_fm is not None and fm_debug_dict.get("ok", False):
                 # Combine: exp_delta = exp_delta + beta * exp_delta_fm
                 # (beta is already applied inside apply_facemesh_exp_assist, so just add)
@@ -1271,7 +1271,7 @@ def main(
             else:
                 error_msg = fm_debug_dict.get("error", "unknown")
                 print(f"[FaceMesh Exp Assist] [SKIP] Skipped (stub or error: {error_msg})")
-                
+
         except Exception as e:
             print(f"[FaceMesh Exp Assist] [FAIL] Exception: {e}")
             import traceback
@@ -1330,19 +1330,19 @@ def main(
     # PHASE 3-5: FACEMESH WARP POST-PROCESS
     # =========================================================================
     # Apply post-process warp to transfer donor asymmetry using dense FaceMesh control points
-    
+
     if facemesh_driving and facemesh_warp:
         print("\n[FaceMesh Warp] Starting post-process warp phase...")
-        
+
         try:
             # Extract landmarks on LivePortrait output (target_after)
             ok_out, L_out, L_out_vis = extractor.extract(img_asym)
-            
+
             if not ok_out:
                 print("[FaceMesh Warp] ✗ Failed to extract landmarks on output image, skipping warp")
             else:
                 print(f"[FaceMesh Warp] ✓ Extracted {len(L_out)} landmarks on output image")
-                
+
                 # Apply warp
                 warp_output_dir = "outputs/diagnostics/facemesh_warp"
                 os.makedirs(warp_output_dir, exist_ok=True)
@@ -1388,7 +1388,7 @@ def main(
                     guard_args["guard_smooth_mode"] = "knn"
                 if guard_mouth_only and facemesh_warp_alpha > max(guard_alpha_start, 0.6):
                     print("[FaceMesh Guard] Warning: mouth-only mode works best with alpha <= 0.6")
-                
+
                 ok_warp, img_asym_warped, warp_summary = apply_facemesh_warp(
                     img_asym,
                     facemesh_result["L_d"],
@@ -1408,38 +1408,38 @@ def main(
                     guard_output_dir=os.path.join(warp_output_dir, "guards"),
                     save_debug=facemesh_debug
                 )
-                
+
                 if ok_warp and img_asym_warped is not None:
                     print("[FaceMesh Warp] ✓ Warp succeeded")
-                    
+
                     # Apply warp result to img_asym for downstream processing
                     img_asym = img_asym_warped
-                    
+
                     # Save displacement field if requested
                     if facemesh_warp_save_field and "disp_field" in warp_summary:
                         np.save(
                             osp.join(warp_output_dir, "disp_field.npy"),
                             warp_summary["disp_field"]
                         )
-                    
+
                     # Run validation if enabled
                     if facemesh_warp_validate:
                         print("[FaceMesh Warp] Running validation...")
-                        
+
                         # Compute target landmarks for all control points
                         # Use the aligned delta from warp computation for correctness
                         L_out_target = L_out.copy()
                         delta_out_aligned = warp_summary.get("delta_out_aligned", None)
-                        
+
                         if delta_out_aligned is None:
                             # Fallback: recompute (should not happen in normal flow)
                             delta_out_aligned = facemesh_result["delta"] @ warp_summary.get("sR", np.eye(2))
-                        
+
                         sel_idx_validate = np.where(facemesh_result["weights"] > 0)[0]
                         for idx in sel_idx_validate:
                             if 0 <= idx < 468:
                                 L_out_target[idx] = L_out[idx] + facemesh_warp_alpha * delta_out_aligned[idx]
-                        
+
                         validation = validate_warp(
                             img_asym,
                             L_out_target,
@@ -1448,7 +1448,7 @@ def main(
                             output_dir=warp_output_dir,
                             verbose=True
                         )
-                        
+
                         warp_summary.update(validation)
 
                     # Phase 7: evaluation metrics
@@ -1483,7 +1483,7 @@ def main(
                     with open(metrics_path, "w") as f:
                         json.dump(metrics_summary, f, indent=2)
                     warp_summary["metrics_path"] = metrics_path
-                    
+
                     # Save warp summary
                     summary_path = osp.join(warp_output_dir, "warp_summary.json")
                     summary_to_save = {
@@ -1492,12 +1492,12 @@ def main(
                     }
                     with open(summary_path, "w") as f:
                         json.dump(summary_to_save, f, indent=2)
-                    
+
                     print(f"[FaceMesh Warp] ✓ Summary saved to {summary_path}")
                 else:
                     print("[FaceMesh Warp] ✗ Warp failed, using original output")
                     warp_summary.update({"warp_succeeded": False})
-        
+
         except Exception as e:
             print(f"[FaceMesh Warp] Error: {e}")
             import traceback
@@ -1583,7 +1583,7 @@ if __name__ == "__main__":
     ap.add_argument("--y_drift_mouth_bias", type=float, default=0.0)
     # Debug: quantify mouth opening (gap) and corner spread (width) for stroke-related asymmetry checks
     ap.add_argument("--lip-metrics", action="store_true", help="Compute lip gap/width metrics and debug overlay.")
-    
+
     # FaceMesh-based asymmetry analysis
     ap.add_argument("--facemesh-driving", action="store_true",
                     help="Enable MediaPipe FaceMesh-based donor asymmetry analysis.")
@@ -1601,7 +1601,7 @@ if __name__ == "__main__":
                     help="Override radius for dynamic cheek patch in pixels.")
     ap.add_argument("--facemesh-refine", action="store_true",
                     help="Use refined FaceMesh landmarks (if supported).")
-    
+
     # FaceMesh Expression Assist - inject FaceMesh mouth signal into exp_delta
     ap.add_argument("--facemesh-exp-assist", action="store_true",
                     help="Enable FaceMesh-based mouth correction in exp_delta pipeline.")

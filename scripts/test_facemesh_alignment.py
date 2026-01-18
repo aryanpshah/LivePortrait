@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 def test_align_flipback_indices():
     """Test alignment of flip-back landmarks."""
     print("\n=== Test: Flip-Back Index Alignment ===")
-    
+
     try:
         from scripts.facemesh_landmarks import align_flipback_indices
     except ImportError as e:
@@ -26,7 +26,7 @@ def test_align_flipback_indices():
 
     # Load real data from existing diagnostics
     base_dir = "outputs/diagnostics/facemesh"
-    
+
     try:
         L_d = np.load(os.path.join(base_dir, "donor_landmarks.npy"))
         L_f_back = np.load(os.path.join(base_dir, "donor_flip_back_landmarks.npy"))
@@ -49,7 +49,7 @@ def test_align_flipback_indices():
 
     # Validate results
     print(f"\nValidation:")
-    
+
     # Check shapes
     if L_f_back_perm.shape != L_d.shape:
         print(f"✗ Shape mismatch: {L_f_back_perm.shape} vs {L_d.shape}")
@@ -66,7 +66,7 @@ def test_align_flipback_indices():
     print(f"✓ Permutation is a valid bijection")
 
     # Check statistics exist and are reasonable
-    required_keys = ['before_mean', 'after_mean', 'improvement_factor', 
+    required_keys = ['before_mean', 'after_mean', 'improvement_factor',
                      'before_dist', 'after_dist', 'fractions']
     for key in required_keys:
         if key not in stats:
@@ -78,19 +78,19 @@ def test_align_flipback_indices():
     before = stats['before_mean']
     after = stats['after_mean']
     improvement = stats['improvement_factor']
-    
+
     print(f"\nAlignment improvement:")
     print(f"  Before: {before:.3f} px")
     print(f"  After:  {after:.3f} px")
     print(f"  Factor: {improvement:.2f}x")
-    
+
     if before <= 0:
         print(f"✗ Invalid before distance: {before}")
         return False
     if after > before:
         print(f"⚠ WARNING: After distance ({after:.3f}) > before ({before:.3f})")
         print(f"  This may indicate alignment didn't improve the result.")
-    
+
     # Check that alignment actually improved things
     if improvement < 1.0:
         print(f"⚠ WARNING: Improvement factor < 1.0 ({improvement:.2f}x)")

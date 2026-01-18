@@ -63,16 +63,16 @@ def main():
                         help="Skip debug visualizations")
     parser.add_argument("--refine", action="store_true",
                         help="Use refined FaceMesh landmarks")
-    
+
     args = parser.parse_args()
-    
+
     print("=" * 70)
     print("FaceMesh Asymmetry Analysis Example")
     print("=" * 70)
-    
+
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
-    
+
     # Read images
     print("\n[1/4] Loading images...")
     try:
@@ -83,7 +83,7 @@ def main():
     except FileNotFoundError as e:
         print(f"  ✗ {e}")
         return 1
-    
+
     # Initialize extractor
     print("\n[2/4] Initializing FaceMesh extractor...")
     extractor = FaceMeshLandmarkExtractor(
@@ -92,7 +92,7 @@ def main():
         verbose=True,
         refine_landmarks=args.refine
     )
-    
+
     # Load region configuration
     print("\n[3/4] Loading region configuration...")
     config = load_facemesh_regions_config(None)
@@ -101,7 +101,7 @@ def main():
     print(f"    - face_oval: {len(config['face_oval'])} landmarks")
     print(f"    - anchors: {len(config['anchors'])} landmarks")
     print(f"    - cheek_seeds: {config['cheek_seeds']}")
-    
+
     # Compute asymmetry
     print("\n[4/4] Computing asymmetry delta...")
     result = compute_donor_asymmetry_delta(
@@ -114,15 +114,15 @@ def main():
         cheek_radius_px=args.cheek_radius_px,
         verbose=True
     )
-    
+
     if not result.get("ok", False):
         print("✗ Asymmetry computation failed")
         return 1
-    
+
     print("\n" + "=" * 70)
     print("RESULTS")
     print("=" * 70)
-    
+
     # Print summary statistics
     summary = result.get("summary", {})
     print(f"\nImage shape: {summary.get('donor_image_shape')}")
@@ -131,17 +131,17 @@ def main():
     if summary.get("bias_vector") is not None:
         bias = summary["bias_vector"]
         print(f"  Bias vector: ({bias[0]:.4f}, {bias[1]:.4f}) px")
-    
+
     print(f"\nAsymmetry magnitudes:")
     print(f"  Mean |Δ|: {summary.get('overall_mean_mag', 0):.4f} px")
     print(f"  Max |Δ|:  {summary.get('overall_max_mag', 0):.4f} px")
     print(f"  Min |Δ|:  {summary.get('overall_min_mag', 0):.4f} px")
-    
+
     clamp = result.get("clamp_params", {})
     print(f"\nClamping:")
     print(f"  Method: {clamp.get('method')}")
     print(f"  Max magnitude: {clamp.get('max_px'):.4f} px")
-    
+
     print(f"\nPer-region statistics:")
     regions = result.get("regions", {})
     for region_name, stats in regions.items():
@@ -150,13 +150,13 @@ def main():
             print(f"    Mean |Δ|: {stats.get('mean_mag', 0):.4f} px")
             print(f"    Max |Δ|:  {stats.get('max_mag', 0):.4f} px")
             print(f"    Count: {stats.get('count')}")
-    
+
     # Generate debug visualizations
     if not args.no_debug:
         print("\n" + "=" * 70)
         print("GENERATING DEBUG VISUALIZATIONS")
         print("=" * 70)
-        
+
         # Landmark overlays
         print("\n  Drawing landmark overlays...")
         groups = {
@@ -165,7 +165,7 @@ def main():
             "cheek_patch": result.get("cheek_patch", []),
             "anchors": config["anchors"],
         }
-        
+
         draw_facemesh_overlay(
             donor_rgb,
             result["L_d"],
@@ -174,7 +174,7 @@ def main():
             label_some=True
         )
         print(f"    ✓ {os.path.join(args.output_dir, 'donor_landmarks_all.png')}")
-        
+
         # Flipped donor
         donor_flip = donor_rgb[:, ::-1, :].copy()
         draw_facemesh_overlay(
@@ -185,7 +185,7 @@ def main():
             label_some=False
         )
         print(f"    ✓ {os.path.join(args.output_dir, 'donor_flip_landmarks.png')}")
-        
+
         # Comparison overlay
         draw_comparison_overlay(
             donor_rgb,
@@ -196,7 +196,7 @@ def main():
             label_2="flip_mirrored_back"
         )
         print(f"    ✓ {os.path.join(args.output_dir, 'flip_back_comparison.png')}")
-        
+
         # Delta heatmap
         print("  Drawing delta heatmap...")
         roi_union = set(
@@ -205,7 +205,7 @@ def main():
             result.get("cheek_patch", [])
         )
         roi_union = sorted(list(roi_union))
-        
+
         draw_delta_heatmap(
             donor_rgb,
             result["L_d"],
@@ -215,16 +215,16 @@ def main():
             scale_px=320.0
         )
         print(f"    ✓ {os.path.join(args.output_dir, 'delta_vectors.png')}")
-        
+
         # Save numpy arrays and summary
         print("  Saving numpy arrays...")
         save_facemesh_numpy_dumps(result, args.output_dir)
         save_facemesh_summary(result, os.path.join(args.output_dir, "summary.json"))
-    
+
     print("\n" + "=" * 70)
     print(f"✓ Analysis complete. Outputs saved to: {args.output_dir}")
     print("=" * 70)
-    
+
     extractor.cleanup()
     return 0
 

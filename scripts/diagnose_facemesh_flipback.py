@@ -69,7 +69,7 @@ def load_landmarks(base_dir: str) -> Tuple[np.ndarray, np.ndarray]:
 
 def load_permutation(base_dir: str) -> np.ndarray | None:
     """Load the permutation array if available, otherwise return None.
-    
+
     Note: The saved L_f_back is already permuted. This loads the permutation
     that was applied so we can show before/after comparison.
     """
@@ -119,7 +119,7 @@ def main() -> None:
     # Note: The loaded lfback is ALREADY permuted (aligned).
     # To show before/after, we need to reconstruct the unaligned version.
     # Unaligned = lfback[inverse_perm]
-    
+
     if perm is not None:
         # Compute inverse permutation: if perm[i] = j, then inv_perm[j] = i
         inv_perm = np.argsort(perm)
@@ -197,7 +197,7 @@ def main() -> None:
                 f"  {idx:3d}: Ld={format_point(ld[idx])}, "
                 f"Lfback={format_point(lfback_unaligned[idx])}, dist={distances_before[idx]:.3f}"
             )
-        
+
         if distances_after is not None:
             print("\nSelected indices (after alignment):")
             for idx in selected_indices:
@@ -216,7 +216,7 @@ def main() -> None:
         "top10_before": [{"idx": int(i), "dist": float(distances_before[i])} for i in top_indices_before.tolist()],
         "selected": [],
     }
-    
+
     if stats_after is not None:
         result["stats_after"] = stats_after
         result["top10_after"] = [{"idx": int(i), "dist": float(distances_after[i])} for i in top_indices_after.tolist()]
@@ -244,7 +244,7 @@ def main() -> None:
     print("\n" + "=" * 70)
     print("VERDICT")
     print("=" * 70)
-    
+
     if stats_after is not None:
         if stats_after["mean"] > 20.0:
             print("✗ AFTER ALIGNMENT: Still NOT index-aligned (unexpected).")

@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 def test_imports():
     """Test that all modules import without errors."""
     print("\n[Test 1] Module imports...")
-    
+
     try:
         from scripts.facemesh_warp import (
             estimate_similarity_umeyama,
@@ -33,7 +33,7 @@ def test_imports():
             draw_displacement_heatmap,
             draw_grid_warp_preview,
         )
-        
+
         print("  ✓ facemesh_warp module imports successfully")
         print(f"    - estimate_similarity_umeyama: {callable(estimate_similarity_umeyama)}")
         print(f"    - align_delta_to_output: {callable(align_delta_to_output)}")
@@ -43,9 +43,9 @@ def test_imports():
         print(f"    - detect_folding: {callable(detect_folding)}")
         print(f"    - apply_facemesh_warp: {callable(apply_facemesh_warp)}")
         print(f"    - validate_warp: {callable(validate_warp)}")
-        
+
         return True
-    
+
     except ImportError as e:
         print(f"  ✗ Import failed: {e}")
         return False
@@ -54,15 +54,15 @@ def test_imports():
 def test_asymmetry_transfer_imports():
     """Test that asymmetry_transfer imports the warp module correctly."""
     print("\n[Test 2] asymmetry_transfer.py integration...")
-    
+
     try:
         from scripts.asymmetry_transfer import main
-        
+
         # Check that main has warp parameters
         import inspect
         sig = inspect.signature(main)
         params = set(sig.parameters.keys())
-        
+
         warp_params = [
             "facemesh_warp",
             "facemesh_warp_method",
@@ -114,7 +114,7 @@ def test_asymmetry_transfer_imports():
 
         print(f"  ✓ main() has all {len(warp_params)} warp and {len(guard_params)} guard parameters")
         return True
-    
+
     except Exception as e:
         print(f"  ✗ Integration check failed: {e}")
         import traceback
@@ -125,11 +125,11 @@ def test_asymmetry_transfer_imports():
 def test_cli_parsing():
     """Test that CLI arguments parse correctly."""
     print("\n[Test 3] CLI argument parsing...")
-    
+
     try:
         # Import asymmetry_transfer to access argparse setup
         import asymmetry_transfer
-        
+
         # Simulate argument parsing
         test_args = [
             "--donor", "test_donor.jpg",
@@ -169,7 +169,7 @@ def test_cli_parsing():
             "--guard-mouth-radius-px", "80",
             "--guard-alpha-start", "0.25",
         ]
-        
+
         # Create parser like in asymmetry_transfer.py
         ap = argparse.ArgumentParser()
         ap.add_argument("--donor", required=True)
@@ -218,9 +218,9 @@ def test_cli_parsing():
         ap.add_argument("--guard-mouth-only", action="store_true")
         ap.add_argument("--guard-mouth-radius-px", type=int, default=90)
         ap.add_argument("--guard-alpha-start", type=float, default=0.3)
-        
+
         args = ap.parse_args(test_args)
-        
+
         assert args.donor == "test_donor.jpg"
         assert args.target == "test_target.jpg"
         assert args.facemesh_warp == True
@@ -257,14 +257,14 @@ def test_cli_parsing():
         assert args.guard_mouth_only is True
         assert args.guard_mouth_radius_px == 80
         assert args.guard_alpha_start == 0.25
-        
+
         print("  ✓ CLI arguments parse correctly")
         print(f"    - facemesh_warp: {args.facemesh_warp}")
         print(f"    - guard_max_delta_px: {args.guard_max_delta_px}")
         print(f"    - guard_softmask: {args.guard_softmask}")
-        
+
         return True
-    
+
     except Exception as e:
         print(f"  ✗ CLI parsing failed: {e}")
         import traceback
@@ -275,10 +275,10 @@ def test_cli_parsing():
 def test_exports():
     """Test that all required functions are exported."""
     print("\n[Test 4] Module exports...")
-    
+
     try:
         import scripts.facemesh_warp as warp_module
-        
+
         required_exports = [
             "estimate_similarity_umeyama",
             "align_delta_to_output",
@@ -292,20 +292,20 @@ def test_exports():
             "draw_displacement_heatmap",
             "draw_grid_warp_preview",
         ]
-        
+
         missing = [name for name in required_exports if not hasattr(warp_module, name)]
-        
+
         if missing:
             print(f"  ✗ Missing exports: {missing}")
             return False
-        
+
         print(f"  ✓ All {len(required_exports)} required functions exported")
         for name in required_exports:
             func = getattr(warp_module, name)
             print(f"    - {name}: {callable(func)}")
-        
+
         return True
-    
+
     except Exception as e:
         print(f"  ✗ Export check failed: {e}")
         return False
@@ -314,30 +314,30 @@ def test_exports():
 def test_docstrings():
     """Test that key functions have docstrings."""
     print("\n[Test 5] Documentation coverage...")
-    
+
     try:
         from scripts.facemesh_warp import (
             estimate_similarity_umeyama,
             apply_facemesh_warp,
             validate_warp,
         )
-        
+
         key_funcs = [
             ("estimate_similarity_umeyama", estimate_similarity_umeyama),
             ("apply_facemesh_warp", apply_facemesh_warp),
             ("validate_warp", validate_warp),
         ]
-        
+
         documented = sum(1 for _, f in key_funcs if f.__doc__ is not None)
-        
+
         print(f"  ✓ {documented}/{len(key_funcs)} functions have docstrings")
-        
+
         for name, func in key_funcs:
             has_doc = "✓" if func.__doc__ else "✗"
             print(f"    {has_doc} {name}")
-        
+
         return documented == len(key_funcs)
-    
+
     except Exception as e:
         print(f"  ✗ Docstring check failed: {e}")
         return False
@@ -348,31 +348,31 @@ def run_all_validations():
     print("=" * 70)
     print("Phase 3-5 FaceMesh Warp - Integration Validation")
     print("=" * 70)
-    
+
     results = []
-    
+
     results.append(("Module imports", test_imports()))
     results.append(("asymmetry_transfer integration", test_asymmetry_transfer_imports()))
     results.append(("CLI argument parsing", test_cli_parsing()))
     results.append(("Module exports", test_exports()))
     results.append(("Documentation", test_docstrings()))
-    
+
     # Summary
     print("\n" + "=" * 70)
     print("Validation Summary")
     print("=" * 70)
-    
+
     passed = sum(1 for _, result in results if result)
     total = len(results)
-    
+
     for test_name, result in results:
         status = "✓ PASS" if result else "✗ FAIL"
         print(f"{status:8} {test_name}")
-    
+
     print("=" * 70)
     print(f"Result: {passed}/{total} tests passed")
     print("=" * 70 + "\n")
-    
+
     return all(result for _, result in results)
 
 
