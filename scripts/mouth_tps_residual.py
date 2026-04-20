@@ -140,24 +140,20 @@ def _lip_vec_norm_stats(v: np.ndarray) -> dict[str, float]:
     return {"mean_norm": float(np.mean(m)), "max_norm": float(np.max(m))}
 
 
-def apply_lip_four_region_grouping(
+def apply_lip_lr_grouping(
     lip_xy: np.ndarray,
     delta_xy: np.ndarray,
     strength: float = 0.55,
     softness: float = 0.20,
     corner_boost: float = 1.25,
-    *,
-    debug: bool = False,
-    debug_dict: Optional[dict[str, Any]] = None,
 ) -> tuple[np.ndarray, dict[str, Any], dict[str, np.ndarray]]:
     """
-    Soft four-region (LU / LL / RU / RL) structure on lip control-point displacements.
+    Structural prior on lip displacement vectors before cap / scale / TPS.
 
-    Two-region left/right pooling was too coarse: upper vs lower and corner balance matter
-    for believable mouth asymmetry. This pass uses mouth-local horizontal and vertical
-    coordinates from actual lip geometry, forms four soft regional means, then reconstructs
-    per-point motion before blending back toward the gated deltas. Runs after side gating v2,
-    before cap / scale / TPS so the dense field sees structured control displacements.
+    Soft left/right coherence (tanh memberships, weighted side means) — not multi-region
+    or topology-residual models. Corners get slightly stronger influence via point_w when
+    estimating side means and via local_strength. Runs after side gating v2 so it shapes the
+    gated field that drives control points.
     """
     lip_xy = np.asarray(lip_xy, dtype=np.float64)
     delta_xy = np.asarray(delta_xy, dtype=np.float64)
@@ -170,65 +166,37 @@ def apply_lip_four_region_grouping(
             delta_xy.copy(),
             {
                 "grouping_enabled": True,
-                "grouping_mode": "four_region",
+                "grouping_mode": "left_right",
                 "error": "empty_lip_points",
             },
             {},
         )
 
     x = lip_xy[:, 0]
-    y = lip_xy[:, 1]
     x_left = float(np.min(x))
     x_right = float(np.max(x))
     cx = 0.5 * (x_left + x_right)
     half_w = max(0.5 * (x_right - x_left), 1e-6)
-    tx = (x - cx) / half_w
-    tx = np.clip(tx, -1.0, 1.0)
-
-    y_top = float(np.min(y))
-    y_bottom = float(np.max(y))
-    cy = 0.5 * (y_top + y_bottom)
-    half_h = max(0.5 * (y_bottom - y_top), 1e-6)
-    ty = (y - cy) / half_h
-    ty = np.clip(ty, -1.0, 1.0)
+    t = (x - cx) / half_w
+    t = np.clip(t, -1.0, 1.0)
 
     s = max(float(softness), 1e-4)
-    w_right = 0.5 * (1.0 + np.tanh(tx / s))
+    w_right = 0.5 * (1.0 + np.tanh(t / s))
     w_left = 1.0 - w_right
-    w_lower = 0.5 * (1.0 + np.tanh(ty / s))
-    w_upper = 1.0 - w_lower
 
-    w_LU = w_left * w_upper
-    w_LL = w_left * w_lower
-    w_RU = w_right * w_upper
-    w_RL = w_right * w_lower
-    w_sum = w_LU + w_LL + w_RU + w_RL + 1e-12
-    w_LU_n = w_LU / w_sum
-    w_LL_n = w_LL / w_sum
-    w_RU_n = w_RU / w_sum
-    w_RL_n = w_RL / w_sum
-
-    cornerness = np.abs(tx)
+    cornerness = np.abs(t)
     point_w = 1.0 + float(corner_boost) * cornerness
+    wl = w_left * point_w
+    wr = w_right * point_w
 
-    def _reg_mean(w_reg: np.ndarray) -> np.ndarray:
-        wt = w_reg * point_w
-        sw = float(np.sum(wt)) + 1e-12
-        return np.sum(wt[:, np.newaxis] * delta_xy, axis=0) / sw
+    sw_l = float(np.sum(wl)) + 1e-12
+    sw_r = float(np.sum(wr)) + 1e-12
+    left_mean = np.sum(wl[:, np.newaxis] * delta_xy, axis=0) / sw_l
+    right_mean = np.sum(wr[:, np.newaxis] * delta_xy, axis=0) / sw_r
 
-    mean_LU = _reg_mean(w_LU)
-    mean_LL = _reg_mean(w_LL)
-    mean_RU = _reg_mean(w_RU)
-    mean_RL = _reg_mean(w_RL)
+    grouped = w_left[:, np.newaxis] * left_mean + w_right[:, np.newaxis] * right_mean
 
-    grouped = (
-        w_LU_n[:, np.newaxis] * mean_LU
-        + w_LL_n[:, np.newaxis] * mean_LL
-        + w_RU_n[:, np.newaxis] * mean_RU
-        + w_RL_n[:, np.newaxis] * mean_RL
-    )
-
-    local_strength = float(strength) * (0.70 + 0.30 * np.abs(tx))
+    local_strength = float(strength) * (0.70 + 0.30 * np.abs(t))
     local_strength = np.clip(local_strength, 0.0, 1.0)
     new_delta = (1.0 - local_strength[:, np.newaxis]) * delta_xy + local_strength[
         :, np.newaxis
@@ -239,50 +207,30 @@ def apply_lip_four_region_grouping(
     norms_after = np.linalg.norm(new_delta, axis=1)
     change = np.linalg.norm(new_delta - delta_xy, axis=1)
 
-    memberships_4 = np.column_stack(
-        [
-            np.asarray(w_LU_n, dtype=np.float64),
-            np.asarray(w_LL_n, dtype=np.float64),
-            np.asarray(w_RU_n, dtype=np.float64),
-            np.asarray(w_RL_n, dtype=np.float64),
-        ]
-    )
-
     metrics: dict[str, Any] = {
         "grouping_enabled": True,
-        "grouping_mode": "four_region",
+        "grouping_mode": "left_right",
         "grouping_strength": float(strength),
         "grouping_softness": float(softness),
         "grouping_corner_boost": float(corner_boost),
-        "mean_LU_dx": float(mean_LU[0]),
-        "mean_LU_dy": float(mean_LU[1]),
-        "mean_LL_dx": float(mean_LL[0]),
-        "mean_LL_dy": float(mean_LL[1]),
-        "mean_RU_dx": float(mean_RU[0]),
-        "mean_RU_dy": float(mean_RU[1]),
-        "mean_RL_dx": float(mean_RL[0]),
-        "mean_RL_dy": float(mean_RL[1]),
+        "left_mean_dx": float(left_mean[0]),
+        "left_mean_dy": float(left_mean[1]),
+        "right_mean_dx": float(right_mean[0]),
+        "right_mean_dy": float(right_mean[1]),
         "mean_delta_norm_before_grouping": float(np.mean(norms_before)),
         "mean_delta_norm_after_grouping": float(np.mean(norms_after)),
         "max_delta_norm_before_grouping": float(np.max(norms_before)),
         "max_delta_norm_after_grouping": float(np.max(norms_after)),
         "mean_grouping_change_norm": float(np.mean(change)),
-        "tx_min": float(np.min(tx)),
-        "tx_max": float(np.max(tx)),
-        "ty_min": float(np.min(ty)),
-        "ty_max": float(np.max(ty)),
-        "mean_w_LU": float(np.mean(w_LU_n)),
-        "mean_w_LL": float(np.mean(w_LL_n)),
-        "mean_w_RU": float(np.mean(w_RU_n)),
-        "mean_w_RL": float(np.mean(w_RL_n)),
+        "left_membership_min": float(np.min(w_left)),
+        "left_membership_max": float(np.max(w_left)),
+        "right_membership_min": float(np.min(w_right)),
+        "right_membership_max": float(np.max(w_right)),
     }
-    if debug and debug_dict is not None:
-        debug_dict["lip_four_region_grouping"] = {k: metrics[k] for k in metrics if k != "grouping_enabled"}
-
-    arrays: dict[str, np.ndarray] = {
-        "tx": tx.astype(np.float64),
-        "ty": ty.astype(np.float64),
-        "memberships": memberships_4,
+    arrays = {
+        "w_left": w_left.astype(np.float64),
+        "w_right": w_right.astype(np.float64),
+        "t": t.astype(np.float64),
     }
     return new_delta.astype(np.float64), metrics, arrays
 
@@ -735,9 +683,9 @@ def apply_mouth_tps_residual(
     delta_lips = delta_gated_pre_cap.copy()
     lip_lr_group_arrays: dict[str, np.ndarray] = {}
     lip_lr_metrics: Optional[dict[str, Any]] = None
-    # --facemesh-group-lr: soft four-region (LU/LL/RU/RL) pooling; same flag as before.
+    # --facemesh-group-lr: soft left/right grouping only (after side gating v2, before cap).
     if facemesh_group_lr:
-        delta_lips, lip_lr_metrics, lip_lr_group_arrays = apply_lip_four_region_grouping(
+        delta_lips, lip_lr_metrics, lip_lr_group_arrays = apply_lip_lr_grouping(
             xy_lip,
             delta_lips,
             strength=facemesh_group_strength,
@@ -922,23 +870,20 @@ def apply_mouth_tps_residual(
                     osp.join(viz_dir, "lip_delta_after_grouping.npy"),
                     np.asarray(delta_after_lr_pre_cap, dtype=np.float64),
                 )
-                mem = lip_lr_group_arrays.get("memberships")
-                if mem is not None:
+                wl_a = lip_lr_group_arrays.get("w_left")
+                wr_a = lip_lr_group_arrays.get("w_right")
+                if wl_a is not None and wr_a is not None:
                     np.save(
-                        osp.join(viz_dir, "lip_group4_memberships.npy"),
-                        np.asarray(mem, dtype=np.float64),
+                        osp.join(viz_dir, "lip_lr_membership.npy"),
+                        np.column_stack(
+                            [np.asarray(wl_a, dtype=np.float64), np.asarray(wr_a, dtype=np.float64)]
+                        ),
                     )
-                tx_a = lip_lr_group_arrays.get("tx")
-                ty_a = lip_lr_group_arrays.get("ty")
-                if tx_a is not None:
+                t_a = lip_lr_group_arrays.get("t")
+                if t_a is not None:
                     np.save(
-                        osp.join(viz_dir, "lip_group4_tx.npy"),
-                        np.asarray(tx_a, dtype=np.float64),
-                    )
-                if ty_a is not None:
-                    np.save(
-                        osp.join(viz_dir, "lip_group4_ty.npy"),
-                        np.asarray(ty_a, dtype=np.float64),
+                        osp.join(viz_dir, "lip_lr_tcoord.npy"),
+                        np.asarray(t_a, dtype=np.float64),
                     )
             _save_dense_disp_viz(
                 viz_dir,
