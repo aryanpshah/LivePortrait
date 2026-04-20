@@ -1,0 +1,21 @@
+{
+  "lips": [
+    61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291,
+    308, 324, 318, 402, 317, 14, 87, 178, 88, 95,
+    185, 40, 39, 37, 0, 267, 269, 270, 409, 415,
+    310, 311, 312, 13, 82, 81, 42, 183, 78
+  ],
+  "face_oval": [
+    10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288,
+    397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136,
+    172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109
+  ],
+  "anchors": [10, 152, 234, 454],
+  "cheek_seeds": [234, 454],
+  "_comments": {
+    "lips": "Outer and inner mouth rings for high-detail driving",
+    "face_oval": "Face contour for lower-face stability scaffold",
+    "anchors": "Global bias removal points; 10=forehead, 152=chin, 234=left cheek, 454=right cheek",
+    "cheek_seeds": "Seed points for dynamic cheek patch computation"
+  }
+}

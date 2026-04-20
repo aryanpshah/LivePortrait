@@ -37,6 +37,7 @@ src/utils/dependencies/XPose/models/UniPose/ops/MultiScaleDeformableAttention.eg
 # Python virtualenvs and local package folders
 venv/
 .venv/
+.venv
 env/
 ENV/
 LivePortrait_env/

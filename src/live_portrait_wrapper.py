@@ -77,6 +77,10 @@ class LivePortraitWrapper(object):
         """ construct the input as standard
         img: HxWx3, uint8, 256x256
         """
+        if img.dtype != np.uint8:
+            raise ValueError(f"prepare_source expects RGB uint8 input, got dtype={img.dtype}")
+        if img.ndim not in (3, 4) or img.shape[-1] != 3:
+            raise ValueError(f"prepare_source expects RGB image with last dim=3, got shape={img.shape}")
         h, w = img.shape[:2]
         if h != self.inference_cfg.input_shape[0] or w != self.inference_cfg.input_shape[1]:
             x = cv2.resize(img, (self.inference_cfg.input_shape[0], self.inference_cfg.input_shape[1]))

@@ -125,8 +125,10 @@ def draw_keypoint_overlay(
     model_h, model_w = model_shape
     pts_model = kp_to_pixels(pts, model_h, model_w)
 
-    scale_x = img_rgb.shape[1] / float(model_w)
-    scale_y = img_rgb.shape[0] / float(model_h)
+    denom_w = max(model_w - 1, 1)
+    denom_h = max(model_h - 1, 1)
+    scale_x = (img_rgb.shape[1] - 1) / float(denom_w)
+    scale_y = (img_rgb.shape[0] - 1) / float(denom_h)
     pts_img = pts_model.copy()
     pts_img[:, 0] = np.clip(pts_img[:, 0] * scale_x, 0, img_rgb.shape[1] - 1)
     pts_img[:, 1] = np.clip(pts_img[:, 1] * scale_y, 0, img_rgb.shape[0] - 1)
