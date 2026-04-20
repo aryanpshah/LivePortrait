@@ -1,32 +1,27 @@
-import sys, os, os.path as osp, cv2, torch, math
+import sys, os, os.path as osp, cv2, torch, math, json
 import numpy as np
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from src.config.inference_config import InferenceConfig
 from src.live_portrait_wrapper import LivePortraitWrapper
 
-# basic run command: python asym_transfer.py \--donor path/to/donor.jpg \--target path/to/target.jpg \--out outputs/asym_transfer.jpg
-
-# Fixed mouth indices from labeled diagnostic map
-LIP_IDX = [5, 17, 20, 18, 19]       # all mouth border points
-LIP_CORNER_IDX = [5, 18]           # left and right mouth corners
+# Tuned from diagnostic maps.
+LIP_IDX = [5, 17, 20, 18, 19]
+LIP_CORNER_IDX = [5, 18]
 
 
 def read_rgb(p):
-    # Read an image as RGB
     img = cv2.imread(p, cv2.IMREAD_COLOR)
     if img is None:
         raise FileNotFoundError(p)
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 def save_rgb(p, img_rgb):
-    # Save RBG image
     os.makedirs(osp.dirname(p), exist_ok=True)
     cv2.imwrite(p, cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR))
 
 def letterbox_to(img_rgb: np.ndarray, out_w: int, out_h: int) -> np.ndarray:
-    # Resize with aspect ratio preserved and pad to (out_h, out_w)
     H, W = img_rgb.shape[:2]
     if H == 0 or W == 0:
         raise ValueError("Invalid image size for letterbox.")
@@ -60,7 +55,6 @@ def procrustes_scale(src_xy: torch.Tensor, dst_xy: torch.Tensor) -> float:
     return float((dst_norm / (src_norm + 1e-8)).item())
 
 def similarity_decompose(src_xy: torch.Tensor, dst_xy: torch.Tensor):
-    # Compute best-fit 2x2 rotation matrix and adjust rotation
     src = src_xy - src_xy.mean(dim=0, keepdim=True)
     dst = dst_xy - dst_xy.mean(dim=0, keepdim=True)
     H = src.T @ dst
@@ -73,7 +67,6 @@ def similarity_decompose(src_xy: torch.Tensor, dst_xy: torch.Tensor):
     return R, theta
 
 def affine_detrend_dx(dx: torch.Tensor, kp_xy: torch.Tensor):
-    # Remove global widening from X motion by fitting: dx ~ a*(x-xc) + b*(y-yc) + c and subtracting it off
     x = kp_xy[:, 0]; y = kp_xy[:, 1]
     xc = x.mean(); yc = y.mean()
     X = torch.stack([x - xc, y - yc, torch.ones_like(x)], dim=1)
@@ -82,7 +75,6 @@ def affine_detrend_dx(dx: torch.Tensor, kp_xy: torch.Tensor):
     return dx - trend, coeff
 
 def affine_detrend_dy(dy: torch.Tensor, kp_xy: torch.Tensor):
-    # Remove global vertical drift/scale/shear in Y: dy ~ a*(x-xc) + b*(y-yc) + c
     x = kp_xy[:, 0]; y = kp_xy[:, 1]
     xc = x.mean(); yc = y.mean()
     X = torch.stack([x - xc, y - yc, torch.ones_like(x)], dim=1)
@@ -91,15 +83,12 @@ def affine_detrend_dy(dy: torch.Tensor, kp_xy: torch.Tensor):
     return dy - trend, coeff
 
 def soft_knee_vec(V: torch.Tensor, tau: float) -> torch.Tensor:
-    # Compress vector magnitudes to avoid extreme values
-    # m' = tau * tanh(m / tau)
     m = torch.linalg.norm(V, dim=-1, keepdim=True) + 1e-8
     m_prime = float(tau) * torch.tanh(m / float(tau))
     gain = (m_prime / m).clamp(max=1.0)
     return V * gain
 
 def soft_knee_scalar(d: torch.Tensor, tau: float) -> torch.Tensor:
-    # Scalar version for X only
     a = d.abs() + 1e-8
     a_prime = float(tau) * torch.tanh(a / float(tau))
     return torch.sign(d) * a_prime
@@ -530,13 +519,45 @@ def main(
     lip_gain_x=None,
     lip_gain_y=None,
     corner_gain=1.6,
+    corner_gain_x=None,
+    corner_gain_y=None,
     norm_cap=2.5,
+    norm_cap_mode: str = "all",
+    debug: bool = False,
     mouth_sym_alpha=0.0,
     y_drift_fix="nonmouth",
     y_anchor=0.5,
     # control how much of the nonmouth bias we subtract from mouth Y (0=keep mouth free)
     y_drift_mouth_bias: float = 0.0,
     lip_metrics: bool = False,
+    inject_stage: str = "post_gain",
+    mouth_pivot: str = "none",
+    mouth_tps_residual: bool = False,
+    mouth_tps_alpha: float = 0.8,
+    mouth_tps_reg: float = 1e-3,
+    mouth_tps_cap_px: float = 15.0,
+    mouth_tps_side: str = "auto",
+    mouth_tps_side_sigma: float = 18.0,
+    mouth_mask_scale: float = 1.35,
+    mouth_mask_blur: int = 0,
+    mouth_tps_debug: bool = False,
+    mouth_remap_interp: str = "cubic",
+    mouth_residual_scale: float = 0.8,
+    mouth_mask_erode_iter: int = 1,
+    mouth_mask_feather_sigma: float = 2.5,
+    lip_sharpen: bool = False,
+    lip_sharpen_amount: float = 0.28,
+    lip_sharpen_sigma: float = 1.0,
+    lip_sharpen_radial: float = 0.90,
+    mouth_save_debug_artifacts: bool = False,
+    mouth_debug_dir: Optional[str] = None,
+    mouth_disable_side_gating: bool = False,
+    mouth_force_side: Optional[str] = None,
+    mouth_debug_arrow_scale: float = 1.0,
+    facemesh_group_lr: bool = False,
+    facemesh_group_strength: float = 0.55,
+    facemesh_group_softness: float = 0.20,
+    facemesh_group_corner_boost: float = 1.25,
 ):
     # load models
     cfg = InferenceConfig(models_config=cfg_path)
@@ -598,6 +619,21 @@ def main(
     exp_delta = raw_delta * float(scale) if side == "right" else -raw_delta * float(scale)
 
     pre_norm = exp_delta.detach().float().norm().item()
+    # Mouth vs stable keypoint masks (same LIP_IDX / LIP_CORNER_IDX as later stages) for norm-cap
+    K_nm = exp_delta.shape[1]
+    mouth_mask_norm = torch.zeros(K_nm, dtype=torch.bool, device=exp_delta.device)
+    for _idx in LIP_IDX:
+        if 0 <= _idx < K_nm:
+            mouth_mask_norm[_idx] = True
+    for _idx in LIP_CORNER_IDX:
+        if 0 <= _idx < K_nm:
+            mouth_mask_norm[_idx] = True
+    stable_mask_norm = ~mouth_mask_norm
+    pre_norm_stable = (
+        torch.linalg.norm(exp_delta[0, stable_mask_norm, :2]).item()
+        if stable_mask_norm.any()
+        else 0.0
+    )
     S0 = exp_delta.clone()
 
     # normalize donor vs target pose/size in canonical space
@@ -668,6 +704,10 @@ def main(
         g_lip_x = float(lip_gain_x) if lip_gain_x is not None else g_lip
         g_lip_y = float(lip_gain_y) if lip_gain_y is not None else g_lip
         g_corner = float(corner_gain)
+        g_corner_x = float(corner_gain_x) if corner_gain_x is not None else g_corner
+        g_corner_y = float(corner_gain_y) if corner_gain_y is not None else g_corner
+        if debug:
+            print(f"[mouth] corner_gain_x={g_corner_x} corner_gain_y={g_corner_y}")
 
         gains_xy = torch.ones((xy.shape[0], 2), dtype=exp_delta.dtype, device=exp_delta.device)
         eb = min(g_eye * g_brow, 1.0)
@@ -675,13 +715,24 @@ def main(
         gains_xy[eye_brow_mask,1] *= eb
         gains_xy[lips_mask,0] *= g_lip_x
         gains_xy[lips_mask,1] *= g_lip_y
-        gains_xy[corner_mask,0] *= g_corner
-        gains_xy[corner_mask,1] *= g_corner
+        gains_xy[corner_mask,0] *= g_corner_x
+        gains_xy[corner_mask,1] *= g_corner_y
 
         no_k  = lips_mask | corner_mask
         k_vec = torch.where(no_k, torch.ones_like(k_vec), k_vec)
 
-        # Optional symmetric Y add-in at the center of the mouth
+        # External mouth-delta injection can plug in here.
+        if inject_stage == "pre_gain":
+            mouth_mask_inj = lips_mask | corner_mask
+            if mouth_mask_inj.any():
+                dy_before = exp_delta[0, mouth_mask_inj, 1].abs()
+                print(f"[inject_stage=pre_gain] BEFORE injection: mouth mean|dy|={dy_before.mean().item():.6f} max|dy|={dy_before.max().item():.6f}")
+
+            if mouth_mask_inj.any():
+                dy_after = exp_delta[0, mouth_mask_inj, 1].abs()
+                print(f"[inject_stage=pre_gain] AFTER injection:  mouth mean|dy|={dy_after.mean().item():.6f} max|dy|={dy_after.max().item():.6f}")
+
+        # Optional symmetric Y term in the center mouth region.
         if float(mouth_sym_alpha) > 0.0:
             sym_term = 0.5 * (E_donor + E_flip_map) - T_kp["exp"]
             sym_term = sym_term.to(exp_delta.device, exp_delta.dtype)
@@ -692,10 +743,18 @@ def main(
             add_y = torch.where(center_lip_mask, 1.6 * sym_y * center_weight, add_y)
             exp_delta[0, mouth_mask_loc, 1] = exp_delta[0, mouth_mask_loc, 1] + add_y[mouth_mask_loc]
 
-        # Apply base & XY gains
         exp_delta[0, :, 0:2] = exp_delta[0, :, 0:2] * k_vec.unsqueeze(-1) * gains_xy
 
-        # Mouth-friendly soft-knee compression
+        if inject_stage == "post_gain":
+            mouth_mask_inj = lips_mask | corner_mask
+            if mouth_mask_inj.any():
+                dy_before = exp_delta[0, mouth_mask_inj, 1].abs()
+                print(f"[inject_stage=post_gain] BEFORE injection: mouth mean|dy|={dy_before.mean().item():.6f} max|dy|={dy_before.max().item():.6f}")
+
+            if mouth_mask_inj.any():
+                dy_after = exp_delta[0, mouth_mask_inj, 1].abs()
+                print(f"[inject_stage=post_gain] AFTER injection:  mouth mean|dy|={dy_after.mean().item():.6f} max|dy|={dy_after.max().item():.6f}")
+
         V = exp_delta[0]
         mags = torch.linalg.norm(V, dim=-1)
         tau_v_all = float(torch.quantile(mags, torch.tensor(0.98, device=mags.device))) * 2.0
@@ -714,7 +773,6 @@ def main(
         a_prime = tau_x * torch.tanh(a / tau_x)
         V[:, 0] = torch.sign(dx) * a_prime
 
-        # Diagnostics
         masks_dict = {
             "lips_mask":       lips_mask,
             "corner_mask":     corner_mask,
@@ -828,7 +886,6 @@ def main(
         yn_abs = yn.abs().clamp(0, 2.0)
         denom = yn_abs.max().clamp_min(1e-6)
         anchor = 1.0 - float(y_anchor) * (yn_abs / denom)
-        # skip anchoring lips or corners so the mouth stays lively
         exp_delta[0, stable, 1] = exp_delta[0, stable, 1] * anchor[stable]
 
     log_stage("S5 (after y_anchor)", exp_delta, {
@@ -838,6 +895,60 @@ def main(
     })
     _log_vertical_metrics("post_y_anchor", exp_delta, stable, ~stable)
     _save_mouth_vectors("post_y_anchor", exp_delta, "outputs/diagnostics/mouth_vectors_post_y_anchor.jpg")
+
+    # Mouth pivot detrend (after y_drift_fix + y_anchor; preserves tilt vs global frown)
+    mouth_mask_final = lips_mask2 | corner_mask2
+    pivot_center_idx = None
+    pivot_dy0 = None
+    mouth_pivot_dy_before = None
+    mouth_pivot_dy_after = None
+    if mouth_pivot != "none" and mouth_mask_final.any():
+        mouth_pivot_dy_before = exp_delta[0, mouth_mask_final, 1].detach().clone()
+        if mouth_pivot == "mean":
+            mean_dy = exp_delta[0, mouth_mask_final, 1].mean()
+            exp_delta[0, mouth_mask_final, 1] -= mean_dy
+            if debug:
+                print(f"[mouth_pivot] mean: subtracted mean_dy={mean_dy.item():.6f}")
+        elif mouth_pivot == "center":
+            m_idx = torch.nonzero(mouth_mask_final, as_tuple=False).squeeze(-1)
+            xy_m = kp_can_t_xy[m_idx]
+            centroid = xy_m.mean(dim=0)
+            d2 = torch.sum((xy_m - centroid) ** 2, dim=1)
+            center_local = int(m_idx[int(d2.argmin())].item())
+            pivot_center_idx = center_local
+            pivot_dy0 = float(exp_delta[0, center_local, 1].item())
+            exp_delta[0, mouth_mask_final, 1] -= exp_delta[0, center_local, 1]
+            if debug:
+                print(f"[mouth_pivot] center: center_idx={center_local} dy0={pivot_dy0:.6f}")
+            if debug and target_kp_pixels is not None and 0 <= center_local < target_kp_pixels.shape[0]:
+                ov = target_rgb.copy()
+                u = int(round(float(target_kp_pixels[center_local, 0])))
+                v = int(round(float(target_kp_pixels[center_local, 1])))
+                u = max(0, min(ov.shape[1] - 1, u))
+                v = max(0, min(ov.shape[0] - 1, v))
+                cv2.circle(ov, (u, v), 10, (255, 0, 255), 2, lineType=cv2.LINE_AA)
+                cv2.imwrite(
+                    "outputs/diagnostics/mouth_pivot_center_overlay.jpg",
+                    cv2.cvtColor(ov, cv2.COLOR_RGB2BGR),
+                )
+        mouth_pivot_dy_after = exp_delta[0, mouth_mask_final, 1].detach().clone()
+        if debug:
+            pdir = "outputs/diagnostics"
+            os.makedirs(pdir, exist_ok=True)
+            with open(osp.join(pdir, "mouth_pivot_debug.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "mouth_pivot": mouth_pivot,
+                        "center_idx": pivot_center_idx,
+                        "dy0": pivot_dy0,
+                        "mouth_dy_mean_before": float(mouth_pivot_dy_before.mean().item()),
+                        "mouth_dy_maxabs_before": float(mouth_pivot_dy_before.abs().max().item()),
+                        "mouth_dy_mean_after": float(mouth_pivot_dy_after.mean().item()),
+                        "mouth_dy_maxabs_after": float(mouth_pivot_dy_after.abs().max().item()),
+                    },
+                    f,
+                    indent=2,
+                )
 
     dx = exp_delta[0, :, 0]
     dx, _coeff = affine_detrend_dx(dx, kp_can_t_xy)
@@ -892,10 +1003,94 @@ def main(
     _save_mouth_vectors("final", exp_delta, "outputs/diagnostics/mouth_vectors.jpg")
     _log_vertical_metrics("final", exp_delta, stable, ~stable)
 
-    post_norm = exp_delta.detach().float().norm().item()
-    cap = float(pre_norm) * float(norm_cap)
-    if (post_norm > cap) and (cap > 1e-8):
-        exp_delta *= (cap / post_norm)
+    tiny_eps = 1e-12
+    mouth_mask_final = lips_mask2 | corner_mask2
+
+    mouth_max_dy_before_cap = (
+        float(exp_delta[0, mouth_mask_final, 1].abs().max().item()) if mouth_mask_final.any() else None
+    )
+
+    if norm_cap_mode == "all":
+        post_norm = exp_delta.detach().float().norm().item()
+        cap = float(pre_norm) * float(norm_cap)
+        if mouth_mask_final.any():
+            mouth_dy_before = exp_delta[0, mouth_mask_final, 1].abs()
+            print(
+                f"[norm_cap] mouth max|dy| BEFORE cap: max={mouth_dy_before.max().item():.6f} mean={mouth_dy_before.mean().item():.6f}"
+            )
+
+            post_norm_stable = exp_delta[0, stable, :].detach().float().norm().item()
+            if (post_norm_stable > cap) and (cap > 1e-8):
+                stable_scale = cap / post_norm_stable
+                exp_delta[0, stable, :] *= stable_scale
+                print(
+                    f"[norm_cap] pre={pre_norm:.6f} post_total={post_norm:.6f} post_stable={post_norm_stable:.6f} stable_scale={stable_scale:.6f}"
+                )
+
+            mouth_dy_after = exp_delta[0, mouth_mask_final, 1].abs()
+            print(
+                f"[norm_cap] mouth max|dy| AFTER cap:  max={mouth_dy_after.max().item():.6f} mean={mouth_dy_after.mean().item():.6f}"
+            )
+        else:
+            if (post_norm > cap) and (cap > 1e-8):
+                exp_delta *= cap / post_norm
+                print(
+                    f"[norm_cap] pre={pre_norm:.6f} post={post_norm:.6f} cap={cap:.6f} scale={cap/post_norm:.6f} (global)"
+                )
+        if debug:
+            mouth_max_dy_after_cap = (
+                float(exp_delta[0, mouth_mask_final, 1].abs().max().item())
+                if mouth_mask_final.any()
+                else None
+            )
+            os.makedirs("outputs/diagnostics", exist_ok=True)
+            with open("outputs/diagnostics/normcap_debug.json", "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "norm_cap_mode": norm_cap_mode,
+                        "pre_norm": pre_norm,
+                        "cap": cap,
+                        "mouth_max_abs_dy_before": mouth_max_dy_before_cap,
+                        "mouth_max_abs_dy_after": mouth_max_dy_after_cap,
+                    },
+                    f,
+                    indent=2,
+                )
+
+    elif norm_cap_mode == "stable_only":
+        post_norm_stable_xy = torch.linalg.norm(exp_delta[0, stable, :2]).item() if stable.any() else 0.0
+        cap_stable = max(float(pre_norm_stable) * float(norm_cap), tiny_eps)
+        scale_factor = 1.0
+        if stable.any() and post_norm_stable_xy > cap_stable:
+            scale_factor = cap_stable / (post_norm_stable_xy + tiny_eps)
+            exp_delta[0, stable, :] *= scale_factor
+
+        print(
+            f"[normcap] mode=stable_only pre_norm_stable={pre_norm_stable:.6f} post_norm_stable={post_norm_stable_xy:.6f} cap_stable={cap_stable:.6f} scale={scale_factor:.6f}"
+        )
+
+        mouth_max_dy_after_cap = (
+            float(exp_delta[0, mouth_mask_final, 1].abs().max().item()) if mouth_mask_final.any() else None
+        )
+        if debug:
+            os.makedirs("outputs/diagnostics", exist_ok=True)
+            with open("outputs/diagnostics/normcap_debug.json", "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "norm_cap_mode": norm_cap_mode,
+                        "pre_norm_stable": pre_norm_stable,
+                        "post_norm_stable_xy": post_norm_stable_xy,
+                        "cap_stable": cap_stable,
+                        "scale_factor": scale_factor,
+                        "norm_cap": float(norm_cap),
+                        "mouth_max_abs_dy_before": mouth_max_dy_before_cap,
+                        "mouth_max_abs_dy_after": mouth_max_dy_after_cap,
+                    },
+                    f,
+                    indent=2,
+                )
+    else:
+        raise ValueError(f"Unknown norm_cap_mode: {norm_cap_mode!r}")
 
     # inject delta into target keypoints and render
     T_kp_mod = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in T_kp.items()}
@@ -952,6 +1147,58 @@ def main(
     img_base_lb = letterbox_to(img_base, out_w_res, out_h_res)
     img_asym_lb = letterbox_to(img_asym, out_w_res, out_h_res)
     donor_lb = letterbox_to(donor_rgb, out_w_res, out_h_res)
+
+    if mouth_tps_residual:
+        _sd = osp.dirname(osp.abspath(__file__))
+        if _sd not in sys.path:
+            sys.path.insert(0, _sd)
+        from mouth_tps_residual import apply_mouth_tps_residual
+        from facemesh_utils import FaceMeshExtractor, default_facemesh_regions
+
+        tps_dbg = osp.join("outputs", "diagnostics", "mouth_tps_residual") if mouth_tps_debug else None
+        art_dir = None
+        if mouth_save_debug_artifacts:
+            art_dir = mouth_debug_dir or osp.join(
+                osp.dirname(osp.abspath(out_path)) or ".",
+                "mouth_debug_artifacts",
+            )
+        fm_ex: Optional[Any] = None
+        try:
+            fm_ex = FaceMeshExtractor()
+            img_asym_lb, tps_sum = apply_mouth_tps_residual(
+                donor_rgb,
+                img_asym_lb,
+                fm_ex,
+                default_facemesh_regions(),
+                alpha=mouth_tps_alpha,
+                reg=mouth_tps_reg,
+                cap_px=mouth_tps_cap_px,
+                side_mode=mouth_tps_side,
+                side_sigma=mouth_tps_side_sigma,
+                mask_scale=mouth_mask_scale,
+                mask_blur=mouth_mask_blur,
+                debug_dir=tps_dbg,
+                mouth_remap_interp=mouth_remap_interp,
+                mouth_residual_scale=mouth_residual_scale,
+                mouth_mask_erode_iter=mouth_mask_erode_iter,
+                mouth_mask_feather_sigma=mouth_mask_feather_sigma,
+                lip_sharpen=lip_sharpen,
+                lip_sharpen_amount=lip_sharpen_amount,
+                lip_sharpen_sigma=lip_sharpen_sigma,
+                lip_sharpen_radial=lip_sharpen_radial,
+                artifact_dir=art_dir,
+                mouth_disable_side_gating=mouth_disable_side_gating,
+                mouth_force_side=mouth_force_side,
+                mouth_debug_arrow_scale=mouth_debug_arrow_scale,
+                facemesh_group_lr=facemesh_group_lr,
+                facemesh_group_strength=facemesh_group_strength,
+                facemesh_group_softness=facemesh_group_softness,
+                facemesh_group_corner_boost=facemesh_group_corner_boost,
+            )
+            print(f"[mouth_tps_residual] ok={tps_sum.get('ok')} error={tps_sum.get('error')}")
+        finally:
+            if fm_ex is not None:
+                fm_ex.close()
 
     side_img = np.hstack([img_base_lb, img_asym_lb])
     cv2.imwrite("outputs/diagnostics/baseline_vs_asym.jpg", cv2.cvtColor(side_img, cv2.COLOR_RGB2BGR))
@@ -1014,8 +1261,32 @@ if __name__ == "__main__":
     ap.add_argument("--lip_gain_x", type=float, default=None)
     ap.add_argument("--lip_gain_y", type=float, default=None)
     ap.add_argument("--corner_gain", type=float, default=1.6)
+    ap.add_argument(
+        "--corner_gain_x",
+        type=float,
+        default=None,
+        
+    )
+    ap.add_argument(
+        "--corner_gain_y",
+        type=float,
+        default=None,
+        
+    )
     # Global motion cap control
     ap.add_argument("--norm_cap", type=float, default=2.5)
+    ap.add_argument(
+        "--norm_cap_mode",
+        type=str,
+        default="all",
+        choices=["all", "stable_only"],
+        
+    )
+    ap.add_argument(
+        "--debug",
+        action="store_true",
+        
+    )
     # Pose alignment
     ap.add_argument("--auto_flip", action="store_true")
     # Mouth symmetry blend (0=off)
@@ -1025,7 +1296,106 @@ if __name__ == "__main__":
     ap.add_argument("--y_anchor", type=float, default=0.5)
     ap.add_argument("--y_drift_mouth_bias", type=float, default=0.0)
     # Debug: quantify mouth opening (gap) and corner spread (width) for stroke-related asymmetry checks
-    ap.add_argument("--lip-metrics", action="store_true", help="Compute lip gap/width metrics and debug overlay.")
+    ap.add_argument("--lip-metrics", action="store_true", )
+    # Injection stage control: when to inject external mouth deltas (e.g., FaceMesh assist)
+    ap.add_argument("--inject_stage", type=str, default="post_gain", choices=["pre_gain", "post_gain"],
+                    )
+    ap.add_argument(
+        "--mouth_pivot",
+        type=str,
+        default="none",
+        choices=["none", "mean", "center"],
+        
+    )
+    ap.add_argument(
+        "--mouth-tps-residual",
+        action="store_true",
+        
+    )
+    ap.add_argument("--mouth-tps-alpha", type=float, default=0.8)
+    ap.add_argument("--mouth-tps-reg", type=float, default=1e-3)
+    ap.add_argument("--mouth-tps-cap-px", type=float, default=15.0)
+    ap.add_argument(
+        "--mouth-tps-side",
+        type=str,
+        default="auto",
+        choices=["bilateral", "right", "left", "auto"],
+    )
+    ap.add_argument("--mouth-tps-side-sigma", type=float, default=18.0)
+    ap.add_argument("--mouth-mask-scale", type=float, default=1.35)
+    ap.add_argument(
+        "--mouth-mask-blur",
+        type=int,
+        default=0,
+        
+    )
+    ap.add_argument(
+        "--mouth-tps-debug",
+        action="store_true",
+        
+    )
+    ap.add_argument(
+        "--mouth-remap-interp",
+        type=str,
+        default="cubic",
+        choices=["linear", "cubic", "lanczos"],
+        
+    )
+    ap.add_argument(
+        "--mouth-residual-scale",
+        type=float,
+        default=0.8,
+        
+    )
+    ap.add_argument(
+        "--mouth-mask-erode-iter",
+        type=int,
+        default=1,
+        
+    )
+    ap.add_argument(
+        "--mouth-mask-feather-sigma",
+        type=float,
+        default=2.5,
+        
+    )
+    ap.add_argument("--lip-sharpen", action="store_true", )
+    ap.add_argument("--lip-sharpen-amount", type=float, default=0.28)
+    ap.add_argument("--lip-sharpen-sigma", type=float, default=1.0)
+    ap.add_argument("--lip-sharpen-radial", type=float, default=0.90, )
+    ap.add_argument(
+        "--mouth-save-debug-artifacts",
+        action="store_true",
+        
+    )
+    ap.add_argument(
+        "--mouth-debug-dir",
+        type=str,
+        default=None,
+        
+    )
+    ap.add_argument(
+        "--mouth-disable-side-gating",
+        action="store_true",
+        
+    )
+    ap.add_argument(
+        "--mouth-force-side",
+        type=str,
+        default=None,
+        choices=["left", "right"],
+        
+    )
+    ap.add_argument(
+        "--mouth-debug-arrow-scale",
+        type=float,
+        default=1.0,
+        
+    )
+    ap.add_argument("--facemesh-group-lr", action="store_true")
+    ap.add_argument("--facemesh-group-strength", type=float, default=0.55)
+    ap.add_argument("--facemesh-group-softness", type=float, default=0.20)
+    ap.add_argument("--facemesh-group-corner-boost", type=float, default=1.25)
 
     a = ap.parse_args()
     main(
@@ -1050,10 +1420,42 @@ if __name__ == "__main__":
         lip_gain_x=a.lip_gain_x,
         lip_gain_y=a.lip_gain_y,
         corner_gain=a.corner_gain,
+        corner_gain_x=a.corner_gain_x,
+        corner_gain_y=a.corner_gain_y,
         norm_cap=a.norm_cap,
+        norm_cap_mode=a.norm_cap_mode,
+        debug=a.debug,
         mouth_sym_alpha=a.mouth_sym_alpha,
         y_drift_fix=a.y_drift_fix,
         y_anchor=a.y_anchor,
         y_drift_mouth_bias=a.y_drift_mouth_bias,
         lip_metrics=a.lip_metrics,
+        inject_stage=a.inject_stage,
+        mouth_pivot=a.mouth_pivot,
+        mouth_tps_residual=a.mouth_tps_residual,
+        mouth_tps_alpha=a.mouth_tps_alpha,
+        mouth_tps_reg=a.mouth_tps_reg,
+        mouth_tps_cap_px=a.mouth_tps_cap_px,
+        mouth_tps_side=a.mouth_tps_side,
+        mouth_tps_side_sigma=a.mouth_tps_side_sigma,
+        mouth_mask_scale=a.mouth_mask_scale,
+        mouth_mask_blur=a.mouth_mask_blur,
+        mouth_tps_debug=a.mouth_tps_debug,
+        mouth_remap_interp=a.mouth_remap_interp,
+        mouth_residual_scale=a.mouth_residual_scale,
+        mouth_mask_erode_iter=a.mouth_mask_erode_iter,
+        mouth_mask_feather_sigma=a.mouth_mask_feather_sigma,
+        lip_sharpen=a.lip_sharpen,
+        lip_sharpen_amount=a.lip_sharpen_amount,
+        lip_sharpen_sigma=a.lip_sharpen_sigma,
+        lip_sharpen_radial=a.lip_sharpen_radial,
+        mouth_save_debug_artifacts=a.mouth_save_debug_artifacts,
+        mouth_debug_dir=a.mouth_debug_dir,
+        mouth_disable_side_gating=a.mouth_disable_side_gating,
+        mouth_force_side=a.mouth_force_side,
+        mouth_debug_arrow_scale=a.mouth_debug_arrow_scale,
+        facemesh_group_lr=a.facemesh_group_lr,
+        facemesh_group_strength=a.facemesh_group_strength,
+        facemesh_group_softness=a.facemesh_group_softness,
+        facemesh_group_corner_boost=a.facemesh_group_corner_boost,
     )
